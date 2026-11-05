@@ -468,7 +468,14 @@ impl Session {
     pub fn set_files(&mut self, specs: &[FileSpec]) -> Result<()> {
         self.ensure_role(Role::Initiator)?;
         let manifest = build_manifest(&self.sid, self.epoch, specs, self.chunk_size)?;
-        self.set_manifest(manifest)
+        self.set_manifest(manifest)?;
+        // carry the per-file compression decision into the send state
+        for (i, spec) in specs.iter().enumerate() {
+            if let Some(f) = self.files.get_mut(i) {
+                f.gzip = Some(spec.gzip);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn set_manifest(&mut self, manifest: Manifest) -> Result<()> {
@@ -1663,6 +1670,17 @@ impl Session {
         self.manifest.as_ref()
     }
 
+    /// The (decrypted) answer SDP known to this side; empty before pairing.
+    pub fn answer_sdp(&self) -> &str {
+        &self.answer_sdp
+    }
+
+    /// The offer SDP known to this side; empty before pairing (responder in
+    /// p3 learns it from blob-3).
+    pub fn offer_sdp(&self) -> &str {
+        &self.offer_sdp
+    }
+
     pub fn file_progress(&self, file: u16) -> Option<(u64, u64, u64)> {
         let f = self.files.iter().find(|f| f.id == file)?;
         Some((
@@ -1730,6 +1748,12 @@ impl Drop for Session {
         self.offer_sdp.zeroize();
         self.answer_sdp.zeroize();
     }
+}
+
+/// gzip-compress `data` and return the compressed length (probe helper for
+/// the "auto" policy).
+pub fn gzip_probe_bytes(data: &[u8]) -> usize {
+    compress_chunk(data).len()
 }
 
 /// gzip a chunk (level 6, rust_backend).

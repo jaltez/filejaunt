@@ -107,7 +107,16 @@ impl PeerHandle {
     pub async fn new(ice: &IceConfig) -> PResult<Arc<PeerHandle>> {
         let mut me = MediaEngine::default();
         me.register_default_codecs()?;
-        let api = APIBuilder::new().with_media_engine(me).build();
+        let mut se = webrtc::api::setting_engine::SettingEngine::default();
+        // CLI-to-CLI on one host: skip mDNS (.local names do not resolve
+        // across processes here) and include loopback candidates so pure
+        // `--stun none` sessions connect on localhost.
+        se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+        se.set_include_loopback_candidate(true);
+        let api = APIBuilder::new()
+            .with_media_engine(me)
+            .with_setting_engine(se)
+            .build();
         let pc = api.new_peer_connection(ice.to_rtc()).await?;
         let state = Arc::new(PeerState {
             channels: Mutex::new(vec![]),
@@ -118,6 +127,19 @@ impl PeerHandle {
             notify: Notify::new(),
         });
 
+        if std::env::var("FJ_DEBUG").is_ok() {
+            pc.on_ice_connection_state_change(Box::new(|st| {
+                Box::pin(async move {
+                    eprintln!("[fj-debug pid={}] ice state: {st:?}", std::process::id());
+                })
+            }));
+            pc.on_peer_connection_state_change(Box::new(|st| {
+                Box::pin(async move {
+                    eprintln!("[fj-debug pid={}] pc state: {st:?}", std::process::id());
+                })
+            }));
+        }
+
         // answer side: channels arrive via on_data_channel
         {
             let state = state.clone();
@@ -126,6 +148,11 @@ impl PeerHandle {
                 Box::pin(async move {
                     if let Some(idx) = channel_index(dc.label()) {
                         wire_channel(&dc, idx, &state);
+                        let mut channels = state.channels.lock().await;
+                        if idx >= channels.len() {
+                            channels.resize(idx + 1, None);
+                        }
+                        channels[idx] = Some(dc.clone());
                     }
                 })
             }));
@@ -192,6 +219,15 @@ impl PeerHandle {
 
     /// Offer side: apply the remote answer.
     pub async fn set_answer(&self, answer_sdp: &str) -> PResult<()> {
+        if std::env::var("FJ_DEBUG").is_ok() {
+            let d = self.pc.local_description().await;
+            let cands = d.map(|d| d.sdp.matches("candidate").count()).unwrap_or(0);
+            eprintln!(
+                "[fj-debug pid={}] set_answer: answer has {} candidate lines; local offer had {cands}",
+                std::process::id(),
+                answer_sdp.matches("candidate").count()
+            );
+        }
         self.pc
             .set_remote_description(RTCSessionDescription::answer(answer_sdp.to_string())?)
             .await?;

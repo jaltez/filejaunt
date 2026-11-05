@@ -1,0 +1,28 @@
+[package]
+name = "fj-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Multi-process CLI e2e tests (loopback, no network)"
+
+[lib]
+path = "common/lib.rs"
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+flate2 = "1"
+
+[[test]]
+name = "cli_transfer"
+path = "e2e/cli_transfer.rs"
+
+[[test]]
+name = "cli_tamper"
+path = "e2e/cli_tamper.rs"
+
+[[test]]
+name = "cli_gzip"
+path = "e2e/cli_gzip.rs"
