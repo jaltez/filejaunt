@@ -18,12 +18,13 @@ if [ "$SIZE" -gt $((5 * 1024 * 1024)) ]; then
   echo "note: single-file artifact exceeds 5 MiB (kept single-file by design)"
 fi
 
-sha256sum "$OUT" | awk '{print $1}' > web/dist/filejaunt.html.sha256
+# standard `sha256sum` format (hash + filename) so `sha256sum -c` verifies it
+(cd web/dist && sha256sum filejaunt.html > filejaunt.html.sha256)
 
 DEST=../filejaunt.com/app
 if mkdir -p "$DEST" 2>/dev/null; then
   cp "$OUT" "$DEST/index.html"
-  cp web/dist/filejaunt.html.sha256 "$DEST/sha256.txt"
+  (cd "$DEST" && sha256sum index.html > sha256.txt)
   echo "==> published to $DEST"
 else
   echo "warning: cannot write $DEST (permissions); artifact stays in web/dist/" >&2
