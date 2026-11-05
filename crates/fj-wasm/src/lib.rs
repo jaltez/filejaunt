@@ -679,24 +679,20 @@ mod parity {
 
         fn push_chunks(&mut self, max: usize) {
             let mut pushed = 0;
-            'outer: loop {
-                for file in self.ini.file_ids() {
-                    while let Some((index, len)) = self.ini.next_send_chunk(file) {
-                        let start = (index * 16384) as usize;
-                        let end = (start + len as usize).min(self.source.len());
-                        let bytes = self.source[start..end].to_vec();
-                        let (wire, actions) =
-                            self.ini.push_chunk_data(file, index, &bytes).unwrap();
-                        self.ini_out.push_back(wire);
-                        self.apply_ini(actions);
-                        pushed += 1;
-                        self.deliver();
-                        if pushed >= max {
-                            break 'outer;
-                        }
+            'outer: for file in self.ini.file_ids() {
+                while let Some((index, len)) = self.ini.next_send_chunk(file) {
+                    let start = (index * 16384) as usize;
+                    let end = (start + len as usize).min(self.source.len());
+                    let bytes = self.source[start..end].to_vec();
+                    let (wire, actions) = self.ini.push_chunk_data(file, index, &bytes).unwrap();
+                    self.ini_out.push_back(wire);
+                    self.apply_ini(actions);
+                    pushed += 1;
+                    self.deliver();
+                    if pushed >= max {
+                        break 'outer;
                     }
                 }
-                break;
             }
         }
 
