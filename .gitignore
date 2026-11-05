@@ -5,3 +5,5 @@ fixtures/big.bin
 playwright-report/
 test-results/
 *.local.*
+crates/fj-wasm/pkg/
+web/dist/
