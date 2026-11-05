@@ -603,9 +603,10 @@ impl Session {
             return self.on_helo(role, version, fp);
         }
         match frame {
-            Frame::Hello { .. } => {
-                self.phase = Phase::Failed;
-                Ok(self.fail_pair(ErrorCode::ProtoMalformed, "duplicate HELO"))
+            Frame::Hello { role, version, fp } => {
+                // duplicate HELOs happen when the peer announces on every
+                // channel; the fingerprint must still match
+                self.on_helo(role, version, fp)
             }
             Frame::Manifest(m) => self.on_manifest(m),
             Frame::ChunkReq { .. } => Ok(vec![]), // push model; BITMAP covers resume

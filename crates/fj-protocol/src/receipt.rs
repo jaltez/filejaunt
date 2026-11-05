@@ -116,9 +116,10 @@ impl Receipt {
         }
     }
 
-    /// Verify this receipt against a canonical passphrase (checks `macpf`).
+    /// Verify this receipt against a passphrase (any separator casing/form;
+    /// canonicalized internally). Checks the passphrase-bound `macpf`.
     /// Structural validity (hex64, base64) is verified first.
-    pub fn verify(&self, passphrase_canonical: &str) -> bool {
+    pub fn verify(&self, passphrase: &str) -> bool {
         if self.v != PROTOCOL_VERSION {
             return false;
         }
@@ -128,7 +129,8 @@ impl Receipt {
         let Ok(sid) = crate::envelope::parse_sid(&self.sid) else {
             return false;
         };
-        let k_pf = crypto::derive_receipt_pf(passphrase_canonical.as_bytes(), &sid);
+        let canon = crate::pake::canonical_passphrase(passphrase);
+        let k_pf = crypto::derive_receipt_pf(canon.as_bytes(), &sid);
         let expect = receipt_mac_pf(
             &k_pf,
             self.file,

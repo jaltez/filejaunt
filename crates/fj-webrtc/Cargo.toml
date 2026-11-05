@@ -1,0 +1,19 @@
+[package]
+name = "fj-webrtc"
+version = "0.1.0"
+edition = "2024"
+description = "filejaunt WebRTC glue: webrtc-rs peer wrapper, STUN client, NAT classifier"
+license = "MIT"
+
+[dependencies]
+fj-protocol = { path = "../fj-protocol" }
+webrtc = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rand = "0.9"
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]

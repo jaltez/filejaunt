@@ -136,12 +136,10 @@ impl Frame {
         }
     }
 
-    /// seq header field: chunk index for CHUNK; `seq` for control frames.
+    /// seq header field: the encryption counter (D4) for every frame; the
+    /// chunk index travels inside the CHUNK payload.
     fn seq(&self, seq: u32) -> u32 {
-        match self {
-            Frame::Chunk { index, .. } => *index as u32,
-            _ => seq,
-        }
+        seq
     }
 
     /// Serialize header+payload. `seq` is the control-frame sequence number
@@ -297,7 +295,7 @@ impl Frame {
                 })
             }
             Chunk => {
-                if payload.len() < 9 {
+                if payload.len() < 11 {
                     return err(ErrorCode::ProtoMalformed, "CHUNK payload too short");
                 }
                 let file =

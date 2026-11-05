@@ -83,7 +83,7 @@ fn chunk_header_fields() {
         gzip: false,
         data: vec![0; 100],
     };
-    let wire = f.encode_to_vec(0);
+    let wire = f.encode_to_vec(5);
     assert_eq!(
         u16::from_le_bytes([wire[2], wire[3]]),
         9,
@@ -91,8 +91,8 @@ fn chunk_header_fields() {
     );
     assert_eq!(
         u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]),
-        77,
-        "seq = index"
+        5,
+        "seq = counter (D4)"
     );
     let back = Frame::decode(&wire).unwrap();
     match back {
