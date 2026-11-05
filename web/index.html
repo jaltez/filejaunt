@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>filejaunt</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; img-src data:; media-src blob:">
+<style>
+body{font-family:monospace;margin:1rem;max-width:60rem}
+header{display:flex;gap:1rem;align-items:baseline}
+#badge{margin-left:auto;padding:0 .4rem;border:1px solid #999}
+section{margin:1rem 0;padding:.6rem;border:1px solid #ccc}
+.hide{display:none}
+#log{background:#f4f4f4;padding:.4rem;max-height:14rem;overflow:auto;white-space:pre-wrap}
+textarea{width:100%;box-sizing:border-box}
+li{margin:.2rem 0}
+video{max-width:32rem}
+button{margin:.1rem .2rem}
+label{display:inline-block;margin:.2rem .4rem .2rem 0}
+details{margin:1rem 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>filejaunt</h1>
+  <span id="badge" title="network path">&mdash;</span>
+</header>
+
+<section id="role">
+  <button id="btn-send">Send</button>
+  <button id="btn-recv">Receive</button>
+</section>
+
+<section id="pair" class="hide">
+  <div><strong id="pair-step">pick files</strong></div>
+  <div id="passphrase-wrap" class="hide">
+    <label>passphrase (say it, don't send it):</label>
+    <div id="passphrase-out" style="user-select:all;font-weight:bold"></div>
+    <button id="copy-pass">Copy passphrase</button>
+  </div>
+  <div>
+    <label>words <input id="words" type="number" min="4" max="12" value="6"></label>
+    <label><input id="private3" type="checkbox"> private (4-paste pairing, no SDP in clear)</label>
+  </div>
+  <div>
+    <label for="pass-in">passphrase (receiver):</label>
+    <input id="pass-in" type="text" autocomplete="off">
+  </div>
+  <div>
+    <textarea id="blob-in" rows="4" placeholder="paste the blob from the other side here"></textarea>
+    <button id="process">Process</button>
+  </div>
+  <div>
+    <textarea id="blob-out" rows="4" readonly placeholder="blob for the other side"></textarea>
+    <button id="copy-blob">Copy blob</button>
+  </div>
+</section>
+
+<section id="send-panel" class="hide">
+  <h2>Send</h2>
+  <div>
+    <input id="file-input" type="file" multiple webkitdirectory>
+    <ul id="queue"></ul>
+  </div>
+  <div>
+    <input id="text-send" type="text" placeholder="text message" autocomplete="off">
+    <button id="text-send-btn">Send text</button>
+  </div>
+  <div>
+    <label>receivers <select id="receivers"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+    <span>(each receiver pairs independently &mdash; open one tab per receiver)</span>
+  </div>
+  <div>
+    <label>channels <select id="channels"><option>1</option><option>4</option></select></label>
+    <label>gzip <select id="gzip"><option>auto</option><option>on</option><option>off</option></select></label>
+    <button id="restart">Pair with a new receiver</button>
+    <span>(resume after a drop: same passphrase)</span>
+  </div>
+</section>
+
+<section id="recv-panel" class="hide">
+  <h2>Receive</h2>
+  <button id="choose-dir">Choose folder</button>
+  <span id="dir-note"></span>
+  <ul id="files"></ul>
+  <video id="video" controls muted playsinline width="480" class="hide"></video>
+  <pre id="text-log"></pre>
+</section>
+
+<pre id="log"></pre>
+
+<details id="advanced">
+  <summary>Advanced</summary>
+  <div><label>STUN servers (comma separated, empty = none/LAN only) <input id="stun" type="text" size="40" placeholder="stun:stun.example:19302"></label></div>
+  <div><label>TURN url <input id="turn-url" type="text" size="30"></label>
+       <label>user <input id="turn-user" type="text" size="12"></label>
+       <label>pass <input id="turn-pass" type="text" size="12"></label></div>
+  <div><button id="doctor">Diagnose NAT</button> <span id="doctor-out"></span></div>
+</details>
+
+<!--FJ_SCRIPT-->
+</body>
+</html>

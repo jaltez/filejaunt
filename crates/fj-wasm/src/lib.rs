@@ -340,6 +340,16 @@ impl FjCore {
         out
     }
 
+    /// The decrypted answer SDP known to this side (for pc.setRemoteDescription).
+    pub fn answer_sdp(&mut self) -> Result<String, JsValue> {
+        self.with_session(|s| Ok(s.answer_sdp().to_string()))
+    }
+
+    /// The offer SDP known to this side (empty before pairing for p3 responders).
+    pub fn offer_sdp(&mut self) -> Result<String, JsValue> {
+        self.with_session(|s| Ok(s.offer_sdp().to_string()))
+    }
+
     pub fn manifest_json(&self) -> Option<String> {
         self.session
             .as_ref()
