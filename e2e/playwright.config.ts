@@ -14,7 +14,7 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
-        launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] },
+        launchOptions: { args: ['--autoplay-policy=no-user-gesture-required', '--disable-features=WebRTCHideLocalIpsWithMdns'] },
       },
     },
     {

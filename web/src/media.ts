@@ -46,9 +46,12 @@ export class StreamPlayer {
     try {
       this.ms = new MediaSource();
       this.enabled = true;
+      // the head chunks (incl. the init segment) arrived before the player
+      // existed — re-queue them so the SourceBuffer gets them first
+      this.head.forEach((part, i) => (this.queue[i] = part));
       this.url = URL.createObjectURL(this.ms);
       this.video.src = this.url;
-      this.video.style.display = '';
+      this.video.classList.remove('hide');
       this.ms.addEventListener('sourceopen', () => this.onSourceOpen());
     } catch {
       this.disable();
@@ -92,7 +95,7 @@ export class StreamPlayer {
     if (this.failed) return;
     this.failed = true;
     this.enabled = false;
-    this.video.style.display = 'none';
+    this.video.classList.add('hide');
     if (this.url) URL.revokeObjectURL(this.url);
   }
 

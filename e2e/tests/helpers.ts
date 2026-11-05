@@ -53,6 +53,26 @@ export async function attachRandomFile(page: Page, name: string, size: number, s
   return sha256Hex(prngFill(seed, size));
 }
 
+/** Attach an existing file (Node-side bytes) to the sender's #file-input. */
+export async function attachFile(page: Page, name: string, mime: string, bytes: Uint8Array): Promise<void> {
+  const handle = await page.evaluateHandle(
+    ({ name, mime, bytes }) => {
+      const file = new File([new Uint8Array(bytes)], name, { type: mime });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      return dt;
+    },
+    { name, mime, bytes: bytes as unknown as number[] },
+  );
+  await page.$eval(
+    '#file-input',
+    (el, dt) => {
+      (el as HTMLInputElement).files = (dt as unknown as DataTransfer).files;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    },
+    handle,
+  );
+}
 /** Repetitive CSV (compressible) built in-page; returns the exact content hash. */
 export async function attachCsvFile(page: Page, name: string, approxSize: number): Promise<{ sha: string; size: number }> {
   return page.evaluate(
@@ -144,7 +164,11 @@ export async function expectVerifiedFile(page: Page, index: number, sha: string,
 export function watchConsole(page: Page): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
-    if (m.type() === 'error') problems.push(`console.error: ${m.text()}`);
+    // Firefox's own FaviconLoader asks for /favicon.ico and trips img-src —
+    // a browser-internal request, not the app fetching anything.
+    if (m.type() === 'error' && !m.text().includes('FaviconLoader')) {
+      problems.push(`console.error: ${m.text()}`);
+    }
   });
   page.on('pageerror', (e) => problems.push(`pageerror: ${String(e)}`));
   return problems;

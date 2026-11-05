@@ -8,6 +8,8 @@
 declare module 'fj-wasm' {
   export class FjCore {
     constructor();
+    offer_sdp(): string;
+    answer_sdp(): string;
     sender_start(words: number, private3: boolean, offer_sdp: string, channels: number): unknown;
     receiver_join(blob1: string, passphrase: string, answer_sdp: string): string;
     initiator_accept(blob2: string): void;

@@ -256,9 +256,8 @@ function wireTransport(t: Transport): void {
   };
 }
 
-function setBlobOut(blob: string, answer: string | null): void {
-  const out = ui.qs<HTMLTextAreaElement>('#blob-out');
-  out.value = answer === null ? blob : `${blob}\n-----\n${answer}`;
+function setBlobOut(blob: string): void {
+  ui.qs<HTMLTextAreaElement>('#blob-out').value = blob;
 }
 
 function startBadgeLoop(): void {
@@ -597,7 +596,7 @@ async function startSender(files: File[]): Promise<void> {
   renderLists();
   ui.qs<HTMLElement>('#passphrase-wrap').classList.remove('hide');
   ui.qs<HTMLElement>('#passphrase-out').textContent = passphrase;
-  setBlobOut(started.blob1, null);
+  setBlobOut(started.blob1);
   ui.setStep('paste blob-1 into the receiver, then paste its blob-2 here');
   expect = 'sender-blob2';
   log(`pairing ready (mode ${private3 ? 'p3' : 'p2'}, channels ${channelCount}, sid ${fj.sid})`);
@@ -620,7 +619,7 @@ async function restartSender(): Promise<void> {
   transport = t;
   wireTransport(t);
   fj.blob1 = blob1;
-  setBlobOut(blob1, null);
+  setBlobOut(blob1);
   ui.setStep('paste the new blob-1 into the receiver, then paste its blob-2 here');
   expect = 'sender-blob2';
   log('resume pairing: new blob-1 ready (same passphrase)');
@@ -663,7 +662,7 @@ async function receiverJoin(blob1: string, pass: string): Promise<void> {
     }
     fj.sid = env.sid;
     fj.passphrase = pass;
-    setBlobOut(blob2, null);
+  setBlobOut(blob2);
     ui.setStep('paste blob-2 into the sender, then paste its blob-3 here');
     expect = 'recv-blob3';
     log('private pairing: blob-2 ready (PAKE only, no SDP in clear)');
@@ -684,8 +683,8 @@ async function receiverJoin(blob1: string, pass: string): Promise<void> {
   wireTransport(t);
   fj.sid = env.sid;
   fj.passphrase = pass;
-  setBlobOut(blob2, t.answerSdp);
-  ui.setStep('paste blob-2 (with the answer) into the sender; transfer starts when it connects');
+  setBlobOut(blob2);
+  ui.setStep('paste blob-2 into the sender; transfer starts when it connects');
   expect = 'none';
   setState('paired');
   log(`joined session ${env.sid}${resuming ? ' (resume)' : ''}`);
@@ -712,22 +711,14 @@ async function receiverBlob3(blob3: string): Promise<void> {
   }
   transport = t;
   wireTransport(t);
-  setBlobOut(blob4, t.answerSdp);
-  ui.setStep('paste blob-4 (with the answer) into the sender');
+  setBlobOut(blob4);
+  ui.setStep('paste blob-4 into the sender');
   expect = 'none';
   setState('paired');
   log('private pairing: blob-4 ready');
 }
 
 // -- #process ---------------------------------------------------------------------
-
-function parsePastedBlob(text: string): { blob: string; answer: string | null } {
-  const sep = '\n-----\n';
-  const i = text.indexOf(sep);
-  if (i < 0) return { blob: text.trim(), answer: null };
-  // textareas normalize CRLF to LF; SDP parsers want CRLF back.
-  return { blob: text.slice(0, i).trim(), answer: normalizeSdp(text.slice(i + sep.length).trim()) };
-}
 
 /** CRLF line endings and a final terminator (libwebrtc rejects a bare last line). */
 function normalizeSdp(sdp: string): string {
@@ -736,8 +727,7 @@ function normalizeSdp(sdp: string): string {
 }
 
 async function onProcess(): Promise<void> {
-  const text = ui.qs<HTMLTextAreaElement>('#blob-in').value;
-  const { blob, answer } = parsePastedBlob(text);
+  const blob = ui.qs<HTMLTextAreaElement>('#blob-in').value.trim();
   if (!blob) return;
   if (role === 'receiver' && expect === 'recv-blob1') {
     await receiverJoin(blob, ui.qs<HTMLInputElement>('#pass-in').value.trim());
@@ -756,13 +746,13 @@ async function onProcess(): Promise<void> {
     }
     if (private3) {
       const blob3 = core.initiatorPrivateBlob3();
-      setBlobOut(blob3, null);
+      setBlobOut(blob3);
       ui.setStep('paste blob-3 into the receiver, then paste its blob-4 here');
       expect = 'sender-blob4';
       log('private pairing: blob-3 ready');
       return;
     }
-    await senderFinishPairing(answer);
+    await senderFinishPairing();
     return;
   }
   if (role === 'sender' && expect === 'sender-blob4' && core) {
@@ -772,20 +762,17 @@ async function onProcess(): Promise<void> {
       fail(String(e));
       return;
     }
-    await senderFinishPairing(answer);
+    await senderFinishPairing();
   }
 }
 
-async function senderFinishPairing(answer: string | null): Promise<void> {
+async function senderFinishPairing(): Promise<void> {
   if (!core || !transport) return;
-  if (!answer) {
-    fail('PROTO_MALFORMED: blob-2 is missing the answer SDP');
-    return;
-  }
+  const answer = normalizeSdp(core.answerSdp());
   try {
     await transport.applyAnswer(answer);
   } catch (e) {
-    fail(`bad answer SDP: ${e} [len=${answer.length} tail=${JSON.stringify(answer.slice(-160))}]`);
+    fail(`bad answer SDP: ${e}`);
     return;
   }
   expect = 'none';

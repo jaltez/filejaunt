@@ -23,17 +23,18 @@ test('receiver reload mid-transfer resumes and completes', async ({ browser }) =
   await startSender(sender);
   await startReceiver(receiver);
 
-  const sha = await attachRandomFile(sender, 'resume-48m.bin', 48 * 1024 * 1024, 0xbadc0de);
-  const blob1 = await waitForBlob1(sender, 120_000);
+  const sha = await attachRandomFile(sender, 'resume-64m.bin', 64 * 1024 * 1024, 0xbadc0de);
+  const blob1 = await waitForBlob1(sender, 180_000);
   const passphrase: string = (await fj(sender)).passphrase;
 
   const blobOut = await receiverProcess(receiver, blob1, passphrase);
   await senderAccept(sender, blobOut);
 
-  // Wait until ~40% arrived, then kill the receiver page.
+  // Interrupt early enough that plenty of the file remains (loopback is fast);
+  // then kill the receiver page mid-transfer.
   await expect
     .poll(async () => (await fj(receiver)).files[0]?.progress ?? 0, { timeout: 240_000 })
-    .toBeGreaterThan(40);
+    .toBeGreaterThan(20);
   await receiver.reload();
   await receiver.click('#btn-recv');
   // Sender re-pairs: new offer, same session/passphrase.

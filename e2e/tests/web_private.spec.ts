@@ -15,10 +15,10 @@ test('private (p3) pairing: 4 pastes, 1 MiB transfers and verifies', async ({ br
   await receiver.waitForSelector('#pass-in');
 
   const sha = await attachRandomFile(sender, 'private-1m.bin', 1024 * 1024, 0xfeed);
+  await waitForBlob1(sender);
   const passphrase: string = (await fj(sender)).passphrase;
 
   // paste 1: blob-1 -> receiver
-  await waitForBlob1(sender);
   await receiver.fill('#pass-in', passphrase);
   await receiver.fill('#blob-in', (await fj(sender)).blob1);
   await receiver.click('#process');
@@ -31,7 +31,7 @@ test('private (p3) pairing: 4 pastes, 1 MiB transfers and verifies', async ({ br
 
   // paste 2: blob-2 -> sender (emits blob-3)
   const blob1Out = await sender.inputValue('#blob-out');
-  await sender.fill('#blob-in', blob2.split('\n-----')[0]);
+  await sender.fill('#blob-in', blob2);
   await sender.click('#process');
   await expect
     .poll(() => sender.inputValue('#blob-out'), { timeout: 30_000 })
@@ -40,14 +40,15 @@ test('private (p3) pairing: 4 pastes, 1 MiB transfers and verifies', async ({ br
   expect(blob3).toContain('FJ1.');
   expect(/v=0|o=-|s=-/.test(blob3)).toBeFalsy();
 
-  // paste 3: blob-3 -> receiver (emits blob-4 + answer)
-  await receiver.fill('#blob-in', blob3.split('\n-----')[0]);
+  // paste 3: blob-3 -> receiver (emits blob-4)
+  const recvOutBefore = await receiver.inputValue('#blob-out');
+  await receiver.fill('#blob-in', blob3);
   await receiver.click('#process');
   await expect
-    .poll(() => receiver.inputValue('#blob-out'))
-    .toContain('-----');
+    .poll(() => receiver.inputValue('#blob-out'), { timeout: 30_000 })
+    .not.toBe(recvOutBefore);
 
-  // paste 4: blob-4 (+ answer) -> sender
+  // paste 4: blob-4 -> sender
   await sender.fill('#blob-in', await receiver.inputValue('#blob-out'));
   await sender.click('#process');
 

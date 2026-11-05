@@ -43,6 +43,7 @@ function newBytes(n: number): Bytes {
 
 class DirSink implements Sink {
   private writable: FjWritable | null = null;
+  private sinceFlush = 0;
   constructor(private readonly file: FjFileHandle, private readonly label: string) {}
 
   private async w(): Promise<FjWritable> {
@@ -53,6 +54,14 @@ class DirSink implements Sink {
   async writeChunk(index: number, chunkSize: number, data: Bytes): Promise<void> {
     const w = await this.w();
     await w.write({ type: 'write', position: index * chunkSize, data });
+    // OPFS writables are transactional: an abrupt page death discards
+    // everything since the last close(). Commit every 128 chunks (2 MiB) so
+    // committed data always runs ahead of the 256-chunk snapshot cadence.
+    if (++this.sinceFlush >= 128) {
+      this.sinceFlush = 0;
+      await w.close();
+      this.writable = null;
+    }
   }
 
   async close(): Promise<void> {

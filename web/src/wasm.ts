@@ -98,6 +98,12 @@ export class FjCore {
   sid(): string {
     return this.raw.sid();
   }
+  offerSdp(): string {
+    return this.raw.offer_sdp();
+  }
+  answerSdp(): string {
+    return this.raw.answer_sdp();
+  }
   isDone(): boolean {
     return this.raw.is_done();
   }
