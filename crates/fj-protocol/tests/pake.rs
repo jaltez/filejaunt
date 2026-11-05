@@ -81,9 +81,8 @@ fn shared_secret_is_fresh_per_run() {
         let sa = a.finish(&msg_b).unwrap();
         let sb = b.finish(&msg_a).unwrap();
         assert_eq!(&*sa, &*sb, "same run, both sides agree");
-        (sa, ())
+        sa
     };
-    k2;
     let canon2 = pass;
     let a2 = PakeSide::start_initiator(canon2.as_bytes(), &sid);
     let b2 = PakeSide::start_responder(canon2.as_bytes(), &sid);
