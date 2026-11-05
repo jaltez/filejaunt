@@ -323,11 +323,16 @@ fn cli_fanout_two_receivers() {
 #[test]
 #[ignore = "networked: probes public STUN"]
 fn cli_doctor_public() {
-    let out = Command::new(bin_path()).args(["doctor", "--stun", "public"]).output().unwrap();
+    let out = Command::new(bin_path())
+        .args(["doctor", "--stun", "public"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        ["DIRECT", "CONE", "SYMMETRIC", "UDP-BLOCKED"].iter().any(|c| stdout.contains(c)),
+        ["DIRECT", "CONE", "SYMMETRIC", "UDP-BLOCKED"]
+            .iter()
+            .any(|c| stdout.contains(c)),
         "some class reported: {stdout}"
     );
 }
