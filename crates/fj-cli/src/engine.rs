@@ -76,6 +76,18 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Structured failure: stderr line always; NDJSON `error` event in --json
+    /// mode (the documented event contract).
+    fn fail_event(&self, code: ErrorCode, msg: &str) -> ErrorCode {
+        eprintln!("[{code}] {msg}");
+        if self.out.mode == Mode::Json {
+            self.out.json(serde_json::json!({
+                "type": "error", "code": code.as_str(), "msg": msg,
+            }));
+        }
+        code
+    }
+
     /// Sender state wrapper: session snapshot + source paths (receiver state
     /// is stored as the plain snapshot).
     fn wrap_sender_state(&self, _sid: &str, session: &Session, sources: &[PathBuf]) -> String {
@@ -422,12 +434,15 @@ impl Engine {
             }
         }
 
+        // resume must keep the restored pairing mode/channel count
+        let effective_private3 = session.private3();
+        let channels = session.channels().max(1);
         let blob2 = read_blob_field(self.out.mode, "blob2")?;
         session.initiator_accept(&blob2).map_err(|e| {
             eprintln!("[{}] pairing failed: {}", e.code(), e.msg());
             ErrorCode::SecPakeFailed
         })?;
-        if private3 {
+        if effective_private3 {
             let blob3 = session.initiator_private_blob3().map_err(|e| {
                 eprintln!("[{}] {}", e.code(), e.msg());
                 ErrorCode::SecPakeFailed
@@ -452,13 +467,14 @@ impl Engine {
         peer.set_answer(session.answer_sdp())
             .await
             .map_err(|_| ErrorCode::IceFailed)?;
-        let frames = wire_frames(&peer, self.channels).await;
+        let frames = wire_frames(&peer, channels).await;
         Ok(SendCtx {
             session,
             peer,
             passphrase,
             sid,
             frames,
+            channels,
         })
     }
 
@@ -511,7 +527,7 @@ impl Engine {
             Action::Send(bytes) => {
                 // HELO / MANIFEST / empty-file DONE: every channel carries
                 // them (duplicate handling is idempotent on the peer)
-                for ch in 0..self.channels.max(1) {
+                for ch in 0..ctx.channels.max(1) {
                     ctx.peer
                         .send_backpressured(ch, bytes.clone())
                         .await
@@ -569,10 +585,7 @@ impl Engine {
                 Ok(false)
             }
             Action::SessionDone => Ok(true),
-            Action::Fail { code, msg } => {
-                eprintln!("[{code}] {msg}");
-                Err(code)
-            }
+            Action::Fail { code, msg } => Err(self.fail_event(code, &msg)),
             _ => Ok(false),
         }
     }
@@ -602,13 +615,14 @@ impl Engine {
         readers: &mut [TakeReader],
         pause_flag: &Arc<AtomicBool>,
         cancel_flag: &Arc<AtomicBool>,
-    ) -> Result<(), ErrorCode> {
-        let mut done_count = 0usize;
+    ) -> Result<bool, ErrorCode> {
+        let mut ctx_done = vec![false; ctxs.len()];
         let mut was_paused = false;
         let mut last_activity = std::time::Instant::now();
         loop {
             // 1) drain inbound frames
-            for ctx in ctxs.iter_mut() {
+            for ci in 0..ctxs.len() {
+                let ctx = &mut ctxs[ci];
                 while let Ok(frame) = ctx.frames.try_recv() {
                     let actions = ctx.session.on_frame(&frame).map_err(|e| e.code())?;
                     for a in actions {
@@ -623,26 +637,28 @@ impl Engine {
                             }
                             other => {
                                 if self.route_sender(ctx, other).await? {
-                                    done_count += 1;
+                                    ctx_done[ci] = true;
                                 }
                             }
                         }
                     }
                 }
             }
-            if done_count >= ctxs.len() {
-                return Ok(());
+            if ctx_done.iter().all(|d| *d) {
+                return Ok(false);
             }
             if cancel_flag.load(Ordering::SeqCst) {
-                // SIGINT/SIGTERM: clean cancel, exit 0
+                // SIGINT/SIGTERM: clean cancel, exit 0 (single terminal event)
                 for ctx in ctxs.iter_mut() {
                     for a in ctx.session.cancel(FILE_ALL) {
-                        let _ = self.route_sender(ctx, a).await;
+                        if let Action::Send(bytes) = a {
+                            let _ = ctx.peer.send_backpressured(0, bytes).await;
+                        }
                     }
                 }
                 self.out
                     .json(serde_json::json!({"type": "done", "ok": false, "cancelled": true}));
-                return Ok(());
+                return Ok(true);
             }
             if pause_flag.load(Ordering::SeqCst) {
                 if !was_paused {
@@ -678,7 +694,8 @@ impl Engine {
             }
             // 2) push one chunk per receiver per round (shared disk read)
             let mut pushed = 0usize;
-            for ctx in ctxs.iter_mut() {
+            for ci in 0..ctxs.len() {
+                let ctx = &mut ctxs[ci];
                 if ctx.session.is_done() || ctx.session.is_failed() {
                     continue;
                 }
@@ -705,7 +722,7 @@ impl Engine {
                             wire.len()
                         );
                     }
-                    let ch = (index as usize) % self.channels.max(1);
+                    let ch = (index as usize) % ctx.channels.max(1);
                     ctx.peer
                         .send_backpressured(ch, wire)
                         .await
@@ -721,7 +738,7 @@ impl Engine {
                                     .map_err(|_| ErrorCode::IceFailed)?;
                             }
                             Action::SessionDone => {
-                                done_count += 1;
+                                ctx_done[ci] = true;
                             }
                             Action::Fail { code, msg } => {
                                 eprintln!("[{code}] {msg}");
@@ -792,24 +809,35 @@ impl Engine {
 
         let session = match resume_sid {
             None => {
-                let offer = env1.sdp.clone().unwrap_or_default();
-                let answer = peer
-                    .accept_offer(&offer, channels)
-                    .await
-                    .map_err(|_| ErrorCode::IceFailed)?;
-                let (mut s, blob2) =
-                    Session::responder_join(&blob1, &passphrase, &answer, &mut limiter).map_err(
-                        |e| {
-                            eprintln!("[{}] {}", e.code(), e.msg());
-                            e.code()
-                        },
-                    )?;
-                self.emit_blob2(&blob2);
                 if private3 {
+                    // p3: blob-2 carries only the PAKE message; the offer
+                    // arrives encrypted in blob-3 and is applied exactly once
+                    let (mut s, blob2) =
+                        Session::responder_join(&blob1, &passphrase, "", &mut limiter).map_err(
+                            |e| {
+                                eprintln!("[{}] {}", e.code(), e.msg());
+                                e.code()
+                            },
+                        )?;
+                    self.emit_blob2(&blob2);
                     self.p3_responder(&peer, &mut s, channels, &mut limiter)
                         .await?;
+                    s
+                } else {
+                    let offer = env1.sdp.clone().unwrap_or_default();
+                    let answer = peer
+                        .accept_offer(&offer, channels)
+                        .await
+                        .map_err(|_| ErrorCode::IceFailed)?;
+                    let (s, blob2) =
+                        Session::responder_join(&blob1, &passphrase, &answer, &mut limiter)
+                            .map_err(|e| {
+                                eprintln!("[{}] {}", e.code(), e.msg());
+                                e.code()
+                            })?;
+                    self.emit_blob2(&blob2);
+                    s
                 }
-                s
             }
             Some(sid_hex) => {
                 let snap = self
@@ -821,23 +849,32 @@ impl Engine {
                     eprintln!("bad session state: {}", e.msg());
                     ErrorCode::StorageFailed
                 })?;
-                let offer = env1.sdp.clone().unwrap_or_default();
-                let answer = peer
-                    .accept_offer(&offer, channels)
-                    .await
-                    .map_err(|_| ErrorCode::IceFailed)?;
-                let blob2 = s
-                    .resume_responder(&blob1, &passphrase, &answer, &mut limiter)
-                    .map_err(|e| {
-                        eprintln!("[{}] {}", e.code(), e.msg());
-                        e.code()
-                    })?;
-                self.emit_blob2(&blob2);
                 if private3 {
+                    let blob2 = s
+                        .resume_responder(&blob1, &passphrase, "", &mut limiter)
+                        .map_err(|e| {
+                            eprintln!("[{}] {}", e.code(), e.msg());
+                            e.code()
+                        })?;
+                    self.emit_blob2(&blob2);
                     self.p3_responder(&peer, &mut s, channels, &mut limiter)
                         .await?;
+                    s
+                } else {
+                    let offer = env1.sdp.clone().unwrap_or_default();
+                    let answer = peer
+                        .accept_offer(&offer, channels)
+                        .await
+                        .map_err(|_| ErrorCode::IceFailed)?;
+                    let blob2 = s
+                        .resume_responder(&blob1, &passphrase, &answer, &mut limiter)
+                        .map_err(|e| {
+                            eprintln!("[{}] {}", e.code(), e.msg());
+                            e.code()
+                        })?;
+                    self.emit_blob2(&blob2);
+                    s
                 }
-                s
             }
         };
 
@@ -849,7 +886,6 @@ impl Engine {
             files: HashMap::new(),
             confirmed: false,
             frames,
-            channels: channels.max(self.channels),
         };
         rx.peer
             .wait_channels_open(Duration::from_secs(20))
@@ -869,10 +905,31 @@ impl Engine {
         }
         self.emit_path(&rx.peer).await;
 
+        // receiver-side SIGINT/SIGTERM: emit CANCEL and exit cleanly
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        crate::signals::install(pause_flag, cancel_flag.clone());
+
         loop {
+            if cancel_flag.load(Ordering::SeqCst) {
+                for a in rx.session.cancel(FILE_ALL) {
+                    if let Action::Send(bytes) = a {
+                        let _ = rx.peer.send_backpressured(0, bytes).await;
+                    }
+                }
+                // let the CANCEL reach the peer before we exit
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.store.delete_session(&rx.sid);
+                self.out
+                    .json(serde_json::json!({"type": "done", "ok": false, "cancelled": true}));
+                return Ok(Outcome::Done);
+            }
             match rx.frames.try_recv() {
                 Ok(frame) => {
-                    let actions = rx.session.on_frame(&frame).map_err(|e| e.code())?;
+                    let actions = match rx.session.on_frame(&frame) {
+                        Ok(a) => a,
+                        Err(e) => return Err(self.fail_event(e.code(), e.msg())),
+                    };
                     for a in actions {
                         if self.route_receiver(&mut rx, out_dir, a).await? {
                             self.store.delete_session(&rx.sid);
@@ -965,12 +1022,12 @@ impl Engine {
     ) -> Result<bool, ErrorCode> {
         match a {
             Action::Send(bytes) => {
-                for ch in 0..rx.channels.max(1) {
-                    rx.peer
-                        .send_backpressured(ch, bytes.clone())
-                        .await
-                        .map_err(|_| ErrorCode::IceFailed)?;
-                }
+                // control replies (HELO/BITMAP/RECEIPT/ERROR) ride channel 0
+                // only; broadcasting duplicates them per channel
+                rx.peer
+                    .send_backpressured(0, bytes)
+                    .await
+                    .map_err(|_| ErrorCode::IceFailed)?;
                 Ok(false)
             }
             Action::SaveChunk { file, index, data } => {
@@ -978,27 +1035,43 @@ impl Engine {
                 Ok(false)
             }
             Action::HashFeed { file } => {
-                let path = rx
-                    .files
-                    .get(&file)
-                    .map(|(p, _)| p.clone())
-                    .ok_or(ErrorCode::StorageFailed)?;
-                let mut buf = Vec::new();
-                std::fs::File::open(&path)
-                    .map_err(|_| ErrorCode::StorageFailed)?
-                    .read_to_end(&mut buf)
-                    .map_err(|_| ErrorCode::StorageFailed)?;
-                // hash_feed actions are flat: notices + Send(RECEIPT) + SessionDone
-                let actions = rx.session.hash_feed(file, &buf).map_err(|e| e.code())?;
+                // zero-chunk files reach HashFeed without any SaveChunk: make
+                // sure the (empty) target exists before hashing
+                self.ensure_target(rx, out_dir, file)?;
+                let path = rx.files[&file].0.clone();
+                // stream the re-read so multi-GB files never sit in RAM
+                let mut fh = std::fs::File::open(&path).map_err(|_| ErrorCode::StorageFailed)?;
+                let mut buf = vec![0u8; 1024 * 1024];
+                let mut actions: Vec<Action> = vec![];
+                loop {
+                    let n = fh.read(&mut buf).map_err(|_| ErrorCode::StorageFailed)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let acts = rx
+                        .session
+                        .hash_feed(file, &buf[..n])
+                        .map_err(|e| e.code())?;
+                    actions.extend(acts);
+                }
+                // zero-size files only: one empty feed finalizes the digest
+                let size = rx
+                    .session
+                    .manifest()
+                    .and_then(|m| m.file(file))
+                    .map(|e| e.size)
+                    .unwrap_or(0);
+                if size == 0 {
+                    let acts = rx.session.hash_feed(file, &[]).map_err(|e| e.code())?;
+                    actions.extend(acts);
+                }
                 for a in actions {
                     match a {
                         Action::Send(bytes) => {
-                            for ch in 0..rx.channels.max(1) {
-                                rx.peer
-                                    .send_backpressured(ch, bytes.clone())
-                                    .await
-                                    .map_err(|_| ErrorCode::IceFailed)?;
-                            }
+                            rx.peer
+                                .send_backpressured(0, bytes)
+                                .await
+                                .map_err(|_| ErrorCode::IceFailed)?;
                         }
                         notice => {
                             if self.route_notice(rx, notice).await? {
@@ -1070,10 +1143,7 @@ impl Engine {
                 self.save_receipt(&r);
                 Ok(false)
             }
-            Action::Fail { code, msg } => {
-                eprintln!("[{code}] {msg}");
-                Err(code)
-            }
+            Action::Fail { code, msg } => Err(self.fail_event(code, &msg)),
             Action::SaveState => {
                 self.store
                     .save_session(&rx.sid, "recv", &rx.session.snapshot())
@@ -1089,6 +1159,47 @@ impl Engine {
         }
     }
 
+    /// Open/create the target file once: ask before overwriting (unless
+    /// --yes), create parents, and fix the final length with `set_len` so a
+    /// stale larger file cannot leak a tail into the hash. On resume the
+    /// chunks already on disk are kept (same size), and missing chunks are
+    /// rewritten by offset.
+    fn ensure_target(&self, rx: &mut Receiver, out_dir: &Path, file: u16) -> Result<(), ErrorCode> {
+        if rx.files.contains_key(&file) {
+            return Ok(());
+        }
+        let entry = rx
+            .session
+            .manifest()
+            .and_then(|m| m.file(file).cloned())
+            .ok_or(ErrorCode::ProtoMalformed)?;
+        let path = out_dir.join(rel_path(&entry.path, &entry.name));
+        if !rx.confirmed && !self.yes && path.exists() {
+            eprintln!("file exists: {}", path.display());
+            eprint!("overwrite? [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            if !line.trim().eq_ignore_ascii_case("y") {
+                return Err(ErrorCode::StorageFailed);
+            }
+        }
+        rx.confirmed = true;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| ErrorCode::StorageFailed)?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|_| ErrorCode::StorageFailed)?;
+        f.set_len(entry.size)
+            .map_err(|_| ErrorCode::StorageFailed)?;
+        rx.files.insert(file, (path, Some(f)));
+        Ok(())
+    }
+
     fn save_chunk(
         &self,
         rx: &mut Receiver,
@@ -1097,43 +1208,16 @@ impl Engine {
         index: u64,
         data: &[u8],
     ) -> Result<(), ErrorCode> {
-        let entry = rx
+        self.ensure_target(rx, out_dir, file)?;
+        let chunk_size = rx
             .session
             .manifest()
-            .and_then(|m| m.file(file).cloned())
+            .and_then(|m| m.file(file))
+            .map(|e| e.chunk_size as u64)
             .ok_or(ErrorCode::ProtoMalformed)?;
-        if !rx.confirmed && !self.yes {
-            let target = out_dir.join(rel_path(&entry.path, &entry.name));
-            if target.exists() {
-                eprintln!("file exists: {}", target.display());
-                eprint!("overwrite? [y/N] ");
-                let _ = std::io::stderr().flush();
-                let mut line = String::new();
-                let _ = std::io::stdin().lock().read_line(&mut line);
-                if !line.trim().eq_ignore_ascii_case("y") {
-                    return Err(ErrorCode::StorageFailed);
-                }
-            }
-            rx.confirmed = true;
-        }
-        let (_path, handle) = rx.files.entry(file).or_insert_with(|| {
-            let path = out_dir.join(rel_path(&entry.path, &entry.name));
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // never truncate here: a resumed file keeps its earlier chunks
-            // (final length is fixed on completion); a fresh receive
-            // overwrites every chunk anyway
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .ok();
-            (path, f)
-        });
+        let (_path, handle) = rx.files.get_mut(&file).ok_or(ErrorCode::StorageFailed)?;
         let f = handle.as_mut().ok_or(ErrorCode::StorageFailed)?;
-        f.write_at(data, index * entry.chunk_size as u64)
+        f.write_at(data, index * chunk_size)
             .map_err(|_| ErrorCode::StorageFailed)?;
         Ok(())
     }
@@ -1158,6 +1242,8 @@ struct SendCtx {
     passphrase: String,
     sid: String,
     frames: std_mpsc::Receiver<Vec<u8>>,
+    /// channels actually negotiated for this context (resume-safe)
+    channels: usize,
 }
 
 struct Receiver {
@@ -1167,7 +1253,6 @@ struct Receiver {
     files: HashMap<u16, (PathBuf, Option<std::fs::File>)>,
     confirmed: bool,
     frames: std_mpsc::Receiver<Vec<u8>>,
-    channels: usize,
 }
 
 /// Read one stdin line: in JSON mode the line is an NDJSON event and the

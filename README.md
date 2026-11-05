@@ -33,12 +33,12 @@ involved; LAN sessions use host candidates only (`--stun none`, the default).
 |:--|:--|
 | E2E encryption (DTLS + SPAKE2-derived AES-GCM layer) | done |
 | Resume after disconnect/crash (bitmap, epoch+1) | done (CLI + web) |
-| Streaming playback (mp4 faststart) | done (web) |
+| Streaming playback (fragmented mp4 for MSE) | done (web) |
 | Path transparency badge (DIRECT/RELAY) | done |
 | NAT diagnosis (`doctor`) | done |
 | CLI ↔ web interop (one protocol core, Rust + WASM) | done |
 | gzip chunk compression (auto/on/off) | done |
-| Multi-channel (4) + fan-out (up to 4 receivers) | done |
+| Multi-channel (4) + fan-out (up to 4 receivers, CLI; web UI is one receiver per tab) | done |
 | Per-file receipts + offline verify | done |
 
 ## Layout

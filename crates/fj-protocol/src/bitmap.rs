@@ -37,6 +37,21 @@ impl Bitmap {
         self.words[(i / 64) as usize] >> (i % 64) & 1 == 1
     }
 
+    /// Set a bit and return true when it actually changed (0 -> 1).
+    pub fn set_counted(&mut self, i: u64) -> bool {
+        if i >= self.len {
+            return false;
+        }
+        let w = &mut self.words[(i / 64) as usize];
+        let bit = 1u64 << (i % 64);
+        if *w & bit == 0 {
+            *w |= bit;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set(&mut self, i: u64, v: bool) {
         if i >= self.len {
             return;

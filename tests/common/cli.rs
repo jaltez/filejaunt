@@ -77,6 +77,8 @@ pub struct PairOpts {
     pub receiver_passphrase: Option<String>,
     /// Kill the receiver once progress passes this fraction (0..1), None=off.
     pub kill_receiver_at: Option<f64>,
+    /// Send a signal to the receiver once progress passes this fraction.
+    pub signal_receiver_at: Option<(f64, i32)>,
     /// Send a signal to the sender once progress passes this fraction:
     /// (fraction, signal number e.g. SIGUSR1=10).
     pub signal_sender_at: Option<(f64, i32)>,
@@ -176,6 +178,8 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
     let sender_pid = sender.id() as i32;
     let mut killed = false;
     let mut signaled = false;
+    let sig_rx_at = opts.signal_receiver_at;
+    let mut signaled_rx = false;
     let signal_at2 = opts.signal_sender_at2;
 
     // single routing loop
@@ -210,6 +214,15 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
                                 killed = true;
                                 unsafe {
                                     libc_kill(receiver_pid, 9);
+                                }
+                            }
+                            if let Some((limit, sig)) = sig_rx_at
+                                && !signaled_rx
+                                && frac >= limit
+                            {
+                                signaled_rx = true;
+                                unsafe {
+                                    libc_kill(receiver_pid, sig);
                                 }
                             }
                             if let Some((limit, sig)) = signal_at

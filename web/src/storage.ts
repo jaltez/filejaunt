@@ -8,7 +8,10 @@ export type Bytes = Uint8Array<ArrayBuffer>;
 export interface Sink {
   writeChunk(index: number, chunkSize: number, data: Bytes): Promise<void>;
   close(): Promise<void>;
-  readAll(): Promise<Bytes>;
+  /** Read a bounded range (streaming verification; never load whole files). */
+  readSlice(offset: number, length: number): Promise<Bytes>;
+  /** Disk-backed file/blob for the download link (no full read into RAM). */
+  downloadBlob(): Promise<Blob>;
   describe(): string;
 }
 
@@ -33,7 +36,11 @@ export interface FjFileHandle {
   getFile(): Promise<File>;
 }
 export interface FjWritable {
-  write(opts: { type: 'write'; position: number; data: BufferSource }): Promise<void>;
+  write(
+    opts:
+      | { type: 'write'; position: number; data: BufferSource }
+      | { type: 'truncate'; size: number },
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -44,10 +51,23 @@ function newBytes(n: number): Bytes {
 class DirSink implements Sink {
   private writable: FjWritable | null = null;
   private sinceFlush = 0;
-  constructor(private readonly file: FjFileHandle, private readonly label: string) {}
+  private initialized = false;
+  constructor(
+    private readonly file: FjFileHandle,
+    private readonly label: string,
+    private readonly size: number,
+  ) {}
 
   private async w(): Promise<FjWritable> {
-    this.writable ??= await this.file.createWritable({ keepExistingData: true });
+    if (!this.writable) {
+      // keepExistingData preserves chunks already on disk (resume); the
+      // one-shot truncate fixes a stale larger file's tail immediately.
+      this.writable = await this.file.createWritable({ keepExistingData: true });
+      if (!this.initialized) {
+        this.initialized = true;
+        await this.writable.write({ type: 'truncate', size: this.size });
+      }
+    }
     return this.writable;
   }
 
@@ -69,9 +89,16 @@ class DirSink implements Sink {
     this.writable = null;
   }
 
-  async readAll(): Promise<Bytes> {
+  async readSlice(offset: number, length: number): Promise<Bytes> {
     const f = await this.file.getFile();
-    return new Uint8Array(await f.arrayBuffer()) as Bytes;
+    const end = Math.min(offset + length, f.size);
+    if (offset >= end) return newBytes(0);
+    return new Uint8Array(await f.slice(offset, end).arrayBuffer()) as Bytes;
+  }
+
+  async downloadBlob(): Promise<Blob> {
+    // File is disk-backed: the object URL streams, no RAM copy.
+    return this.file.getFile();
   }
 
   describe(): string {
@@ -91,16 +118,29 @@ class MemorySink implements Sink {
     /* nothing to flush */
   }
 
-  async readAll(): Promise<Bytes> {
-    const total = this.parts.reduce((n, p) => n + (p?.length ?? 0), 0);
-    const out = newBytes(total);
+  async readSlice(offset: number, length: number): Promise<Bytes> {
+    const chunkSize = 16384;
+    let out = newBytes(0);
     let o = 0;
-    for (const p of this.parts) {
+    for (let i = Math.floor(offset / chunkSize); i * chunkSize < offset + length; i++) {
+      const p = this.parts[i];
       if (!p) continue;
-      out.set(p, o);
-      o += p.length;
+      const start = Math.max(0, offset - i * chunkSize);
+      const end = Math.min(p.length, offset + length - i * chunkSize);
+      if (end <= start) continue;
+      const part = p.subarray(start, end) as Bytes;
+      const merged = newBytes(out.length + part.length);
+      merged.set(out, 0);
+      merged.set(part, out.length);
+      out = merged;
+      o += part.length;
     }
+    void o;
     return out;
+  }
+
+  async downloadBlob(): Promise<Blob> {
+    return new Blob(this.parts.filter((p): p is Bytes => !!p));
   }
 
   describe(): string {
@@ -142,6 +182,10 @@ export class ReceiverStore {
     }
     const fh = await d.getFileHandle(entry.name, { create: true });
     const where = this.mode === 'opfs' ? `private storage: filejaunt-${this.sid}/` : '';
-    return new DirSink(fh, `${where}${entry.path ? entry.path + '/' : ''}${entry.name}`);
+    return new DirSink(
+      fh,
+      `${where}${entry.path ? entry.path + '/' : ''}${entry.name}`,
+      entry.size,
+    );
   }
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorCode, Result, err};
 use crate::{
     CHUNK_SIZE_DEFAULT, CHUNK_SIZE_LARGE, MAX_FILES, MAX_NAME_BYTES, MAX_PATH_BYTES,
-    PROTOCOL_VERSION,
+    MAX_TOTAL_CHUNKS, PROTOCOL_VERSION,
 };
 
 /// Per-file compression policy. `Auto` is resolved to a boolean by the glue
@@ -135,11 +135,15 @@ impl Manifest {
         crate::envelope::parse_sid(&self.sid).map_err(|_| {
             crate::error::Error::new(ErrorCode::PathRejected, "manifest sid invalid")
         })?;
+        if self.files.is_empty() {
+            return err(ErrorCode::PathRejected, "empty manifest");
+        }
         if self.files.len() > MAX_FILES {
             return err(ErrorCode::PathRejected, "too many files in manifest");
         }
         let mut ids = std::collections::HashSet::with_capacity(self.files.len());
         let mut total = 0u64;
+        let mut total_chunks = 0u64;
         for f in &self.files {
             if !ids.insert(f.id) {
                 return err(
@@ -156,6 +160,9 @@ impl Manifest {
                     format!("bad chunk_size {}", f.chunk_size),
                 );
             }
+            if f.chunks > u32::MAX as u64 {
+                return err(ErrorCode::PathRejected, "chunk count exceeds u32");
+            }
             let expect = chunks_for(f.size, f.chunk_size);
             if f.chunks != expect {
                 return err(
@@ -163,7 +170,16 @@ impl Manifest {
                     format!("file {} chunks {} != expected {expect}", f.id, f.chunks),
                 );
             }
+            total_chunks = total_chunks.checked_add(f.chunks).ok_or_else(|| {
+                crate::error::Error::new(ErrorCode::PathRejected, "chunk total overflow")
+            })?;
             total = total.saturating_add(f.size);
+        }
+        if total_chunks > MAX_TOTAL_CHUNKS {
+            return err(
+                ErrorCode::PathRejected,
+                "manifest chunk total exceeds limit",
+            );
         }
         if self.total != total {
             return err(ErrorCode::PathRejected, "manifest total mismatch");

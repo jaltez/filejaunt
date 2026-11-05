@@ -7,7 +7,7 @@
 // fingerprint (HMAC-SHA256 over offer+answer) still detects any SDP
 // substitution, so this keeps p2's authentication guarantees.
 
-import { newFjCore, type FjCore, type FjActionJson } from './wasm';
+import { Hasher, newFjCore, type FjCore, type FjActionJson } from './wasm';
 import { Transport, doctorProbe, type IceConfig, type PathInfo } from './transport';
 import { ReceiverStore, type FjDirHandle, type Sink } from './storage';
 import { StreamPlayer } from './media';
@@ -180,8 +180,31 @@ async function inflateBlob1(raw: string): Promise<Envelope1> {
   const stream = new Blob([bytes]).stream().pipeThrough(new DS('gzip'));
   let json: string;
   try {
-    json = new TextDecoder().decode(await readStreamBytes(stream));
-  } catch {
+    // hard cap mirrored from the core (64 KiB decompressed)
+    const reader = stream.getReader();
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.length;
+        if (total > 64 * 1024) {
+          void reader.cancel();
+          throw new Error('PROTO_MALFORMED: envelope decompressed exceeds 64 KiB');
+        }
+        parts.push(value);
+      }
+    }
+    const merged = new Uint8Array(new ArrayBuffer(total));
+    let o = 0;
+    for (const p of parts) {
+      merged.set(p, o);
+      o += p.length;
+    }
+    json = new TextDecoder().decode(merged);
+  } catch (e) {
+    if (String(e).includes('PROTO_MALFORMED')) throw e;
     throw new Error('PROTO_MALFORMED: bad gzip in blob');
   }
   try {
@@ -199,6 +222,7 @@ let core: FjCore | null = null;
 let transport: Transport | null = null;
 let store: ReceiverStore | null = null;
 let player: StreamPlayer | null = null;
+let playerFileId: number | null = null;
 let pickedDir: FjDirHandle | null = null;
 let role: 'sender' | 'receiver' | null = null;
 let expect: Expect = 'none';
@@ -301,7 +325,7 @@ async function applyActions(actions: FjActionJson[], announce = false): Promise<
           const sink = (rec.sink ??= await store!.sink(rec));
           rec.sinkLabel = sink.describe();
           await sink.writeChunk(a.index as number, rec.chunkSize, data);
-          if (player) {
+          if (player && rec.id === playerFileId) {
             player.considerHead(a.index as number, data, rec.size);
             player.push(a.index as number, data);
           }
@@ -370,18 +394,23 @@ async function applyActions(actions: FjActionJson[], announce = false): Promise<
 }
 
 function finalizeFile(rec: FileRec): void {
-  player?.finish();
-  if (store?.mode === 'memory' && rec.verified && rec.sink) {
-    void rec.sink.readAll().then((bytes) => {
-      const url = URL.createObjectURL(new Blob([bytes]));
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = rec.name;
-      a.textContent = `download ${rec.name}`;
-      a.rel = 'noopener';
-      ui.qs<HTMLElement>('#files').append(a);
-      log(`saved via browser download: ${rec.name}`);
-    });
+  if (player && rec.id === playerFileId) player.finish();
+  if (rec.verified && rec.sink) {
+    // every storage mode offers a retrieval path: OPFS is origin-private, so
+    // the download link is the only way out in browsers without FSA
+    void rec.sink
+      .downloadBlob()
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = rec.name;
+        a.textContent = `download ${rec.name}`;
+        a.rel = 'noopener';
+        ui.qs<HTMLElement>('#files').append(a);
+        log(`download link ready: ${rec.name} (${rec.sinkLabel ?? 'memory'})`);
+      })
+      .catch((e) => log(`download link failed: ${e}`));
   } else if (rec.sinkLabel) {
     log(`saved to ${rec.sinkLabel}`);
   }
@@ -391,14 +420,15 @@ async function hashFeedFile(id: number): Promise<void> {
   const rec = recById(id);
   if (!rec || !core || !rec.sink) return;
   await rec.sink.close();
-  const all = await rec.sink.readAll();
-  if (!all.length) {
+  if (rec.size === 0) {
     core.hashFeed(id, new Uint8Array(0));
     await applyActions(take());
     return;
   }
-  for (let o = 0; o < all.length; o += HASH_FEED_SLICE) {
-    core.hashFeed(id, all.subarray(o, Math.min(o + HASH_FEED_SLICE, all.length)));
+  // stream the re-read in bounded slices: multi-GB files never sit in RAM
+  for (let o = 0; o < rec.size; o += HASH_FEED_SLICE) {
+    const slice = await rec.sink.readSlice(o, Math.min(HASH_FEED_SLICE, rec.size - o));
+    core.hashFeed(id, slice);
     await applyActions(take());
   }
 }
@@ -446,7 +476,10 @@ function refreshManifest(): Promise<void> {
     });
   }
   const video = recs.find((r) => r.name.toLowerCase().endsWith('.mp4'));
-  if (video) player = new StreamPlayer(ui.qs<HTMLVideoElement>('#video'));
+  if (video) {
+    player = new StreamPlayer(ui.qs<HTMLVideoElement>('#video'));
+    playerFileId = video.id;
+  }
   syncFilesHook();
   renderLists();
   log(`manifest: ${m.files.length} file(s)`);
@@ -529,12 +562,44 @@ function nextChunkPlan(): [number, number, number] | null {
 // -- sender setup ---------------------------------------------------------------
 
 async function sha256Hex(file: File): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  // incremental hashing: never materialize a whole multi-GB file in JS memory
+  const h = new Hasher();
+  const step = 4 << 20;
+  for (let o = 0; o < file.size; o += step) {
+    const buf = new Uint8Array(await file.slice(o, Math.min(o + step, file.size)).arrayBuffer());
+    h.update(buf);
+  }
+  return h.finish();
+}
+
+/** Fresh session state: a second pairing in the same tab must not inherit
+ * the previous run's files, player, storage handles or pairing step. */
+function resetSession(): void {
+  pumpGen++;
+  transport?.close();
+  transport = null;
+  player = null;
+  playerFileId = null;
+  store = null;
+  manifestLoaded = false;
+  expect = 'none';
+  chain = Promise.resolve();
+  recs.length = 0;
+  fj.files = [];
+  fj.resumedChunks = 0;
+  fj.wireBytes = 0;
+  fj.path = '';
+  fj.blob1 = '';
+  fj.receipts = [];
+  ui.qs<HTMLElement>('#files').replaceChildren();
+  ui.qs<HTMLElement>('#queue').replaceChildren();
+  ui.qs<HTMLTextAreaElement>('#blob-out').value = '';
+  ui.qs<HTMLElement>('#video').classList.add('hide');
 }
 
 async function startSender(files: File[]): Promise<void> {
   if (!files.length) return;
+  resetSession();
   setState('pairing');
   ui.setStep('hashing files…');
   log(`sending ${files.length} file(s)`);
@@ -628,6 +693,7 @@ async function restartSender(): Promise<void> {
 // -- receiver setup --------------------------------------------------------------
 
 async function receiverJoin(blob1: string, pass: string): Promise<void> {
+  resetSession();
   setState('pairing');
   let env: Envelope1;
   try {

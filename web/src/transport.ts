@@ -9,7 +9,7 @@ export interface IceConfig {
 
 const GATHER_TIMEOUT_MS = 10_000;
 export const BACKPRESSURE_HIGH = 1 << 20;
-export const BACKPRESSURE_LOW = 256 << 1024;
+export const BACKPRESSURE_LOW = 256 << 10; // 256 KiB
 
 function rtcConfig(cfg: IceConfig): RTCConfiguration {
   const iceServers: RTCIceServer[] = [];

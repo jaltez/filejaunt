@@ -1,6 +1,6 @@
 // WASM bootstrap: decode the inlined base64 wasm, initialize the module once,
 // and wrap the snake_case wasm-bindgen API in a camelCase facade.
-import init, { FjCore as RawFjCore, WASM_B64, type FjActionJson } from 'fj-wasm';
+import init, { FjCore as RawFjCore, Hasher as RawHasher, WASM_B64, type FjActionJson } from 'fj-wasm';
 
 export type { FjActionJson };
 
@@ -14,6 +14,17 @@ function plain(value: unknown): unknown {
   }
   if (Array.isArray(value)) return value.map(plain);
   return value;
+}
+
+/** Incremental SHA-256 (streaming source hashing). */
+export class Hasher {
+  private readonly raw = new RawHasher();
+  update(bytes: Uint8Array): void {
+    this.raw.update(bytes);
+  }
+  finish(): string {
+    return this.raw.finish();
+  }
 }
 
 export interface SenderStart {
@@ -112,6 +123,9 @@ export class FjCore {
   }
   fileIds(): number[] {
     return this.raw.file_ids();
+  }
+  debugJson(): string {
+    return this.raw.debug_json();
   }
   manifestJson(): string | null {
     return this.raw.manifest_json() ?? null;

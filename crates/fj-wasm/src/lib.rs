@@ -23,6 +23,8 @@ use fj_protocol::session::{Action, Role, Session, SessionOpts};
 pub struct FjCore {
     session: Option<Session>,
     pending: Vec<JsValue>,
+    /// Failed pairing attempts for this tab (across joins, per sid).
+    limiter: fj_protocol::pake::AttemptLimiter,
 }
 
 fn action_to_js(a: Action) -> JsValue {
@@ -91,6 +93,7 @@ impl FjCore {
         FjCore {
             session: None,
             pending: vec![],
+            limiter: fj_protocol::pake::AttemptLimiter::new(),
         }
     }
 
@@ -126,9 +129,9 @@ impl FjCore {
         passphrase: &str,
         answer_sdp: &str,
     ) -> Result<String, JsValue> {
-        let mut limiter = fj_protocol::pake::AttemptLimiter::new();
         let (session, blob2) =
-            Session::responder_join(blob1, passphrase, answer_sdp, &mut limiter).map_err(err_js)?;
+            Session::responder_join(blob1, passphrase, answer_sdp, &mut self.limiter)
+                .map_err(err_js)?;
         self.session = Some(session);
         Ok(blob2)
     }
@@ -148,8 +151,10 @@ impl FjCore {
 
     /// Responder decrypts blob-3; returns the offer SDP for the browser.
     pub fn responder_private_offer(&mut self, blob3: &str) -> Result<String, JsValue> {
-        let mut limiter = fj_protocol::pake::AttemptLimiter::new();
-        self.with_session(|s| s.responder_private_offer(blob3, &mut limiter))
+        let mut limiter = std::mem::take(&mut self.limiter);
+        let out = self.with_session(|s| s.responder_private_offer(blob3, &mut limiter));
+        self.limiter = limiter;
+        out
     }
 
     pub fn responder_private_blob4(&mut self, answer_sdp: &str) -> Result<String, JsValue> {
@@ -180,8 +185,11 @@ impl FjCore {
         passphrase: &str,
         answer_sdp: &str,
     ) -> Result<String, JsValue> {
-        let mut limiter = fj_protocol::pake::AttemptLimiter::new();
-        self.with_session(|s| s.resume_responder(blob1, passphrase, answer_sdp, &mut limiter))
+        let mut limiter = std::mem::take(&mut self.limiter);
+        let out =
+            self.with_session(|s| s.resume_responder(blob1, passphrase, answer_sdp, &mut limiter));
+        self.limiter = limiter;
+        out
     }
 
     // -- files & transfer -----------------------------------------------------
@@ -225,6 +233,25 @@ impl FjCore {
     pub fn on_frame(&mut self, bytes: js_sys::Uint8Array) -> Result<(), JsValue> {
         let actions = self.with_session(|s| s.on_frame(&bytes.to_vec()))?;
         for a in actions {
+            // HELO/SDP authentication failures count as pairing failures
+            if let Action::Fail {
+                code: fj_protocol::ErrorCode::SecHelloMismatch,
+                ..
+            } = &a
+                && let Some(sess) = self.session.as_ref()
+            {
+                let sid = sess.sid();
+                let over = self.limiter.record_failure(&sid).is_err();
+                self.pending.push(action_to_js(Action::Fail {
+                    code: if over {
+                        fj_protocol::ErrorCode::SecAttemptLimit
+                    } else {
+                        fj_protocol::ErrorCode::SecHelloMismatch
+                    },
+                    msg: "pairing authentication failed".into(),
+                }));
+                continue;
+            }
             self.pending.push(action_to_js(a));
         }
         Ok(())
@@ -350,6 +377,11 @@ impl FjCore {
         self.with_session(|s| Ok(s.offer_sdp().to_string()))
     }
 
+    /// Diagnostics (no key material): phase, per-file counters.
+    pub fn debug_json(&mut self) -> Result<String, JsValue> {
+        self.with_session(|s| Ok(s.debug_json()))
+    }
+
     pub fn manifest_json(&self) -> Option<String> {
         self.session
             .as_ref()
@@ -458,6 +490,46 @@ impl FjCore {
 }
 
 impl Default for FjCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Incremental SHA-256 for streaming file hashing in the browser (WebCrypto
+/// has no streaming digest).
+#[wasm_bindgen]
+pub struct Hasher {
+    inner: Option<sha2::Sha256>,
+}
+
+#[wasm_bindgen]
+impl Hasher {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Hasher {
+        use sha2::Digest;
+        Hasher {
+            inner: Some(sha2::Sha256::new()),
+        }
+    }
+
+    pub fn update(&mut self, bytes: js_sys::Uint8Array) {
+        use sha2::Digest;
+        if let Some(h) = self.inner.as_mut() {
+            h.update(bytes.to_vec());
+        }
+    }
+
+    /// Hex digest; consumes the state (call once).
+    pub fn finish(&mut self) -> String {
+        use sha2::Digest;
+        match self.inner.take() {
+            Some(h) => hex::encode(h.finalize()),
+            None => String::new(),
+        }
+    }
+}
+
+impl Default for Hasher {
     fn default() -> Self {
         Self::new()
     }

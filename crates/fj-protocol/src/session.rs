@@ -157,6 +157,8 @@ struct Snapshot {
     epoch: u32,
     #[serde(default)]
     private3: bool,
+    #[serde(default = "one_channel")]
+    channels: usize,
     manifest: Option<Manifest>,
     tx: u32,
     rx: u32,
@@ -175,8 +177,14 @@ struct FileState {
     sent: Bitmap,
     /// Sender: chunks the receiver confirmed (BITMAP).
     acked: Bitmap,
+    /// Sender: acked | sent, maintained incrementally (O(1) completion test).
+    covered: Bitmap,
+    covered_ones: u64,
+    /// Sender: next index to consider in the send plan (O(1) amortized).
+    cursor: u64,
     /// Receiver: chunks written.
     have: Bitmap,
+    have_ones: u64,
     done_claimed: bool,
     done_sent: bool,
     file_done: bool,
@@ -221,6 +229,10 @@ pub struct Session {
     resumed: bool,
     chunks_since_save: u64,
     hashers: std::collections::HashMap<u16, (sha2::Sha256, u64)>,
+}
+
+fn one_channel() -> usize {
+    1
 }
 
 fn now_ts() -> i64 {
@@ -440,6 +452,8 @@ impl Session {
             return err(ErrorCode::ProtoMalformed, "resume epoch must be exactly +1");
         }
         self.epoch = env1.ep;
+        self.channels = env1.ch.clamp(1, crate::CHANNELS_MAX);
+        self.private3 = matches!(mode, PairingMode::P3);
         self.reset_transport_state();
         self.passphrase = Zeroizing::new(crate::pake::canonical_passphrase(passphrase));
         self.pair_respond(&env1).inspect_err(|_| {
@@ -464,7 +478,16 @@ impl Session {
         let pending: Vec<(u16, Vec<(u64, u64)>)> = self
             .files
             .iter()
-            .filter(|f| !f.file_done && !f.have.is_full())
+            .filter(|f| {
+                !f.file_done
+                    && f.have_ones
+                        < self
+                            .manifest
+                            .as_ref()
+                            .and_then(|m| m.file(f.id))
+                            .map(|e| e.chunks)
+                            .unwrap_or(0)
+            })
             .map(|f| (f.id, f.have.to_runs()))
             .collect();
         for (file, runs) in pending {
@@ -500,7 +523,11 @@ impl Session {
                 id: f.id,
                 sent: Bitmap::new(f.chunks),
                 acked: Bitmap::new(f.chunks),
+                covered: Bitmap::new(f.chunks),
+                covered_ones: 0,
+                cursor: 0,
                 have: Bitmap::new(f.chunks),
+                have_ones: 0,
                 done_claimed: false,
                 done_sent: false,
                 file_done: false,
@@ -735,15 +762,16 @@ impl Session {
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "MANIFEST sid/epoch mismatch"));
         }
         m.validate()?;
-        let uniform = m
-            .files
-            .iter()
-            .all(|f| f.chunk_size == m.files[0].chunk_size);
+        let Some(first) = m.files.first() else {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(ErrorCode::PathRejected, "empty manifest"));
+        };
+        let uniform = m.files.iter().all(|f| f.chunk_size == first.chunk_size);
         if !uniform {
             self.phase = Phase::Failed;
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "manifest mixes chunk sizes"));
         }
-        self.chunk_size = m.files[0].chunk_size;
+        self.chunk_size = first.chunk_size;
         self.set_manifest(m)?;
         Ok(vec![Action::SaveState])
     }
@@ -780,6 +808,10 @@ impl Session {
             self.phase = Phase::Failed;
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "chunk length mismatch"));
         }
+        // a completed file ignores any duplicate traffic (resume re-sends)
+        if self.file_ref(file).map(|f| f.file_done).unwrap_or(false) {
+            return Ok(vec![]);
+        }
         let dup = self
             .file_ref(file)
             .map(|f| f.have.get(index))
@@ -791,7 +823,9 @@ impl Session {
             f.wire_bytes += wire_len;
         } else {
             let f = self.file_mut(file).expect("file state");
-            f.have.set(index, true);
+            if f.have.set_counted(index) {
+                f.have_ones += 1;
+            }
             f.bytes_moved += raw.len() as u64;
             f.wire_bytes += wire_len;
             actions.push(Action::SaveChunk {
@@ -818,7 +852,7 @@ impl Session {
         }
         let (full, claimed) = {
             let f = self.file_ref(file).expect("file state");
-            (f.have.is_full(), f.done_claimed)
+            (f.have_ones >= entry.chunks, f.done_claimed)
         };
         if full && claimed {
             actions.extend(self.start_hash(file));
@@ -838,7 +872,7 @@ impl Session {
         if f.file_done {
             return Ok(vec![]);
         }
-        let full = f.have.is_full();
+        let full = f.have_ones >= entry.chunks;
         f.done_claimed = true;
         if full || entry.chunks == 0 {
             Ok(self.start_hash(file))
@@ -850,6 +884,9 @@ impl Session {
     /// Receiver: begin (or immediately finish, for empty files) hash
     /// verification of a completed file.
     fn start_hash(&mut self, file: u16) -> Vec<Action> {
+        if self.file_ref(file).map(|f| f.file_done).unwrap_or(false) {
+            return vec![];
+        }
         if self.hashers.contains_key(&file) {
             return vec![];
         }
@@ -956,7 +993,17 @@ impl Session {
             .merge_runs(&runs);
         let (acked_count, wire_bytes) = match merged {
             Ok(_) => {
-                let f = self.file_ref(file).expect("file state");
+                let f = self.file_mut(file).expect("file state");
+                // acked bits are covered too; new holes may sit before the
+                // cursor, so the plan rescans from the start
+                for (start, len) in f.acked.to_runs() {
+                    for i in start..start + len {
+                        if f.covered.set_counted(i) {
+                            f.covered_ones += 1;
+                        }
+                    }
+                }
+                f.cursor = 0;
                 (f.acked.count_ones(), f.wire_bytes)
             }
             Err(e) => {
@@ -998,8 +1045,8 @@ impl Session {
             return None;
         }
         let n = entry.chunks;
-        // first index not acked and not sent this epoch
-        let mut i = 0u64;
+        // first index not acked and not sent this epoch, from the cursor
+        let mut i = f.cursor;
         while i < n {
             if !f.acked.get(i) && !f.sent.get(i) {
                 let len = std::cmp::min(
@@ -1079,6 +1126,10 @@ impl Session {
         let (done, wire_total) = {
             let f = self.file_mut(file).expect("file state");
             f.sent.set(index, true);
+            f.cursor = index + 1;
+            if f.covered.set_counted(index) {
+                f.covered_ones += 1;
+            }
             f.bytes_moved += bytes.len() as u64;
             f.wire_bytes += wire.len() as u64;
             (f.bytes_moved, f.wire_bytes)
@@ -1096,8 +1147,7 @@ impl Session {
         // sent bitmap alone never fills (pre-resume chunks are only acked).
         let all_covered = {
             let f = self.file_ref(file).expect("file state");
-            let chunks = entry.chunks;
-            f.acked.union_count(&f.sent) >= chunks && !f.done_sent
+            f.covered_ones >= entry.chunks && !f.done_sent
         };
         if all_covered {
             self.file_mut(file).expect("file state").done_sent = true;
@@ -1168,8 +1218,9 @@ impl Session {
         let digest_bytes = hex::decode(&r.sha256).map_err(|_| {
             crate::error::Error::new(ErrorCode::ProtoMalformed, "receipt sha256 not hex")
         })?;
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&digest_bytes);
+        let digest: [u8; 32] = digest_bytes.try_into().map_err(|_| {
+            crate::error::Error::new(ErrorCode::ProtoMalformed, "receipt sha256 must be 32 bytes")
+        })?;
         let k_pf = self.k_pf.as_ref().expect("keys").clone();
         let macpf =
             crate::receipt::receipt_mac_pf(&k_pf, r.file, &r.sha256.to_lowercase(), r.bytes, r.ts);
@@ -1246,6 +1297,45 @@ impl Session {
     }
 
     /// Local resume (emits RESUME to the peer).
+    /// Debug/diagnostic snapshot (no key material).
+    pub fn debug_json(&self) -> String {
+        let phase = match self.phase {
+            Phase::Paired => "paired",
+            Phase::HeloPending => "heloPending",
+            Phase::Active => "active",
+            Phase::Done => "done",
+            Phase::Failed => "failed",
+        };
+        let files: Vec<serde_json::Value> = self
+            .files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id,
+                    "acked": f.acked.count_ones(),
+                    "sent": f.sent.count_ones(),
+                    "covered": f.covered_ones,
+                    "have": f.have_ones,
+                    "cursor": f.cursor,
+                    "doneSent": f.done_sent,
+                    "fileDone": f.file_done,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "phase": phase,
+            "role": match self.role { Role::Initiator => "initiator", Role::Responder => "responder" },
+            "epoch": self.epoch,
+            "resumed": self.resumed,
+            "done": self.is_done(),
+            "failed": self.is_failed(),
+            "paused": self.paused.iter().copied().collect::<Vec<_>>(),
+            "cancelled": self.cancelled.iter().copied().collect::<Vec<_>>(),
+            "files": files,
+        })
+        .to_string()
+    }
+
     pub fn resume(&mut self, file: u16) -> Vec<Action> {
         self.set_paused(file, false);
         vec![self.send(Frame::Resume { file }), Action::SaveState]
@@ -1535,9 +1625,20 @@ impl Session {
         self.helo_received = false;
         self.chunks_since_save = 0;
         self.hashers.clear();
-        // sender: this epoch re-sends anything not acked
+        // sender: this epoch re-sends anything not acked; coverage is
+        // recomputed from the receiver-confirmed bitmap only
         for f in &mut self.files {
             f.sent = Bitmap::new(f.sent.len());
+            f.cursor = 0; // rescan from the start of this epoch's plan
+            f.covered = Bitmap::new(f.acked.len());
+            f.covered_ones = 0;
+            for (start, len) in f.acked.to_runs() {
+                for i in start..start + len {
+                    if f.covered.set_counted(i) {
+                        f.covered_ones += 1;
+                    }
+                }
+            }
             f.done_sent = f.file_done;
             f.done_claimed = f.done_claimed || f.file_done;
         }
@@ -1554,6 +1655,7 @@ impl Session {
             sid: hex::encode(self.sid),
             epoch: self.epoch,
             private3: self.private3,
+            channels: self.channels,
             manifest: self.manifest.clone(),
             tx: self.tx_counter,
             rx: self.rx_counter,
@@ -1598,7 +1700,7 @@ impl Session {
             sid,
             epoch: snap.epoch,
             private3: snap.private3,
-            channels: 1,
+            channels: snap.channels.clamp(1, crate::CHANNELS_MAX),
             chunk_size: snap
                 .manifest
                 .as_ref()
@@ -1657,6 +1759,15 @@ impl Session {
                 f.wire_bytes = fs.wire_bytes;
                 f.dups = fs.dups;
                 f.gzip = fs.gzip;
+                f.have_ones = f.have.count_ones();
+                f.covered_ones = 0;
+                f.cursor = 0;
+                for i in 0..f.covered.len() {
+                    if f.acked.get(i) || f.sent.get(i) {
+                        f.covered.set(i, true);
+                        f.covered_ones += 1;
+                    }
+                }
             }
         }
         Ok(s)
@@ -1680,6 +1791,16 @@ impl Session {
 
     pub fn epoch(&self) -> u32 {
         self.epoch
+    }
+
+    /// Whether this session uses private (p3) pairing (restored on resume).
+    pub fn private3(&self) -> bool {
+        self.private3
+    }
+
+    /// Data channel count of this session (restored/resumed from the envelope).
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     pub fn is_done(&self) -> bool {

@@ -41,7 +41,7 @@ if [ ! -s fixtures/video-faststart.mp4 ]; then
   if command -v ffmpeg >/dev/null 2>&1; then
     ffmpeg -y -loglevel error -f lavfi -i testsrc=duration=30:size=640x360:rate=24 \
       -f lavfi -i sine=frequency=440:duration=30 \
-      -movflags +faststart -pix_fmt yuv420p -c:v libx264 -c:a aac \
+      -movflags +frag_keyframe+empty_moov+default_base_moof -pix_fmt yuv420p -c:v libx264 -c:a aac \
       fixtures/video-faststart.mp4
   else
     echo "warning: ffmpeg not found; video-faststart.mp4 not generated." >&2

@@ -54,6 +54,11 @@ pub const GATHER_TIMEOUT_MS: u64 = 10_000;
 pub const PAKE_ATTEMPT_LIMIT: u32 = 3;
 
 pub const MAX_FILES: usize = 4096;
+
+/// Upper bound on the sum of chunk counts in one manifest (memory DoS guard:
+/// bitmaps are allocated per file; 2^27 chunks ≈ 16 MiB per bitmap, 512 GiB
+/// of 16 KiB chunks).
+pub const MAX_TOTAL_CHUNKS: u64 = 1 << 27;
 pub const MAX_PATH_BYTES: usize = 1024;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_TEXT_BYTES: usize = 32 * 1024;

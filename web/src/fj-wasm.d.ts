@@ -6,9 +6,15 @@
 // a camelCase facade. Methods throw on error with a plain string
 // "CODE: message" where CODE is a protocol ErrorCode (SEC_*, PROTO_*, ...).
 declare module 'fj-wasm' {
+  export class Hasher {
+    constructor();
+    update(bytes: Uint8Array): void;
+    finish(): string;
+  }
   export class FjCore {
     constructor();
     offer_sdp(): string;
+    debug_json(): string;
     answer_sdp(): string;
     sender_start(words: number, private3: boolean, offer_sdp: string, channels: number): unknown;
     receiver_join(blob1: string, passphrase: string, answer_sdp: string): string;

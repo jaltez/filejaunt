@@ -336,3 +336,79 @@ fn cli_doctor_public() {
         "some class reported: {stdout}"
     );
 }
+
+#[test]
+#[ignore]
+fn cli_private_transfer() {
+    let out = "/tmp/fj-e2e-private";
+    fresh_dir(out);
+    let outcome = run_transfer(
+        &["../fixtures/random.bin"],
+        out,
+        PairOpts {
+            sender_args: vec!["--private".into()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(outcome.sender.exit_code(), 0, "p3 sender");
+    assert_eq!(outcome.receiver.exit_code(), 0, "p3 receiver");
+    assert_eq!(
+        sha256_file(&format!("{out}/random.bin")),
+        sha256_file("../fixtures/random.bin")
+    );
+    assert!(
+        outcome.receiver.json_events("fileDone")[0]["verified"] == serde_json::Value::Bool(true)
+    );
+}
+
+#[test]
+#[ignore]
+fn cli_empty_file() {
+    let out = "/tmp/fj-e2e-empty";
+    fresh_dir(out);
+    let empty = "/tmp/fj-e2e-empty-src.dat";
+    std::fs::write(empty, b"").unwrap();
+    let outcome = run_transfer(&[empty], out, PairOpts::default());
+    assert_eq!(outcome.sender.exit_code(), 0);
+    assert_eq!(outcome.receiver.exit_code(), 0);
+    let landed = format!("{out}/fj-e2e-empty-src.dat");
+    assert_eq!(
+        std::fs::metadata(&landed).unwrap().len(),
+        0,
+        "empty file created"
+    );
+    assert_eq!(
+        outcome.receiver.json_events("fileDone")[0]["verified"],
+        serde_json::Value::Bool(true)
+    );
+}
+
+#[test]
+#[ignore]
+fn cli_cancel_sigint() {
+    let out = "/tmp/fj-e2e-cancel";
+    fresh_dir(out);
+    // SIGINT the receiver mid-transfer: it cancels cleanly (exit 0) and the
+    // sender sees PEER_CANCEL (exit 1 with a structured error event).
+    let outcome = run_transfer(
+        &["../fixtures/big.bin"],
+        out,
+        PairOpts {
+            signal_receiver_at: Some((0.10, 2)),
+            ..Default::default()
+        },
+    );
+    assert_eq!(outcome.receiver.exit_code(), 0, "own cancel is clean");
+    assert_eq!(outcome.sender.exit_code(), 1, "sender PEER_CANCEL exit 1");
+    let errs = outcome.sender.json_events("error");
+    assert!(
+        errs.iter().any(|e| e["code"] == "PEER_CANCEL"),
+        "sender got PEER_CANCEL: {errs:?}"
+    );
+    // a fresh receive from scratch still works afterwards
+    let out2 = "/tmp/fj-e2e-cancel2";
+    fresh_dir(out2);
+    let again = run_transfer(&["../fixtures/random.bin"], out2, PairOpts::default());
+    assert_eq!(again.sender.exit_code(), 0);
+    assert_eq!(again.receiver.exit_code(), 0);
+}

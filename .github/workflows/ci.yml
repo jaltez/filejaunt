@@ -17,6 +17,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: scripts/gen-fixtures.sh
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -61,7 +62,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: cargo build -p fj-cli --release
+      - run: cargo build -p fj-cli
       - run: npm ci
         working-directory: web
       - run: npx tsc --noEmit
@@ -70,9 +71,9 @@ jobs:
         working-directory: web
       - run: npm ci
         working-directory: e2e
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps chromium firefox
         working-directory: e2e
-      - run: npx playwright test --project=chromium
+      - run: npx playwright test
         working-directory: e2e
 
   supply-chain:

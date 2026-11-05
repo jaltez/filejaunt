@@ -32,7 +32,9 @@ HKDF-SHA256, HMAC-SHA256, AES-256-GCM, comparaciones constant-time
 ## Límites operativos
 
 - PAKE online: 3 intentos fallidos por sid en memoria del receptor
-  (`SEC_ATTEMPT_LIMIT`).
+  (`SEC_ATTEMPT_LIMIT`). En el CLI el límite es por proceso (cada ejecución
+  es un intento); en la web el limitador vive en la instancia `FjCore` de la
+  pestaña. Un fallo de HELO/SDP se contabiliza igual que un fallo PAKE.
 - Manifests estrictamente validados (nombres/rutas sin traversal,
   `PATH_REJECTED` + abort). El glue nunca escribe fuera del outdir.
 - Los snapshots de sesión NO contienen material clave; las claves se
@@ -43,6 +45,20 @@ HKDF-SHA256, HMAC-SHA256, AES-256-GCM, comparaciones constant-time
 
 Reporta vulnerabilidades abriendo un issue privado / security advisory en
 este repositorio. No hay bounty; respuesta de cortesía en <7 días.
+
+## Notas de plataforma
+
+- Streaming: los SourceBuffer de MSE necesitan mp4 fragmentado (`moov` +
+  `moof`); el fixture commitado es fMP4 y el e2e lo usa tal cual.
+- En WSL2, Chromium ↔ webrtc-rs necesita
+  `--disable-features=WebRTCHideLocalIpsWithMdns` (solo Playwright; los
+  candidatos mDNS no resuelven contra webrtc-rs).
+- El reproductor puede rechazar un fichero; la transferencia nunca falla por
+  el player.
+- Versión web v1: un receptor por pestaña (el fan-out multi-receptor es solo
+  CLI); el resume exige el mismo backend de almacenamiento (OPFS) y misma
+  pestaña/perfil — el snapshot no se reanuda contra un directorio FSA elegido
+  a mano.
 
 ## Checklist de build reproducible
 

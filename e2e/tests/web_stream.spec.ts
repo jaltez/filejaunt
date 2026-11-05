@@ -3,9 +3,7 @@
 import { test, expect } from '@playwright/test';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { rootDir } from './paths';
 import {
   attachFile,
@@ -19,17 +17,10 @@ import {
 } from './helpers';
 
 test('video plays before the transfer completes', async ({ browser }) => {
-  // The committed fixture is faststart but NOT fragmented; Chromium's MSE
-  // only plays fragmented mp4, so remux a streamable copy (repo untouched).
+  // The committed fixture is fragmented (empty moov + moof), which Chromium
+  // MSE can stream directly; no runtime remux is involved.
   const fixture = join(rootDir, 'fixtures', 'video-faststart.mp4');
-  const tmp = mkdtempSync(join(tmpdir(), 'fj-stream-'));
-  const frag = join(tmp, 'video-fmp4.mp4');
-  try {
-    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', fixture, '-c', 'copy', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', frag]);
-  } catch {
-    test.skip(true, 'ffmpeg unavailable: cannot remux the fixture to fragmented mp4 for MSE streaming');
-  }
-  const bytes = readFileSync(frag);
+  const bytes = readFileSync(fixture);
   const sha = createHash('sha256').update(bytes).digest('hex');
 
   const senderCtx = await browser.newContext();
@@ -40,7 +31,7 @@ test('video plays before the transfer completes', async ({ browser }) => {
   await startSender(sender);
   await startReceiver(receiver);
 
-  await attachFile(sender, 'video-fmp4.mp4', 'video/mp4', new Uint8Array(bytes));
+  await attachFile(sender, 'video-faststart.mp4', 'video/mp4', new Uint8Array(bytes));
   const blob1 = await waitForBlob1(sender, 120_000);
   const passphrase: string = (await fj(sender)).passphrase;
 

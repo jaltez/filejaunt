@@ -18,19 +18,35 @@ export class StreamPlayer {
   private nextAppend = 0;
   private appending = false;
   private head: Bytes[] = [];
+  private headParts = new Map<number, Bytes>();
   private headLen = 0;
   private eos = false;
 
   constructor(private readonly video: HTMLVideoElement) {}
 
-  /** Feed the head bytes; decides streaming once 64 KiB (or file end) arrived. */
+  /**
+   * Feed chunk bytes for the moov probe. SaveChunk delivery can be out of
+   * order with multiple channels: buffer by index and decide once the
+   * contiguous prefix from 0 reaches 64 KiB (or the whole file).
+   */
   considerHead(index: number, data: Bytes, size: number): void {
     if (this.decided) return;
-    // only contiguous bytes from 0 count for the moov probe
-    if (index !== this.head.length) return;
-    this.head.push(data);
-    this.headLen += data.length;
-    if (this.headLen >= Math.min(HEAD_WINDOW, size)) this.decide(size);
+    if (this.headParts.has(index)) return;
+    this.headParts.set(index, data);
+    // recompute the contiguous prefix from index 0
+    this.head = [];
+    this.headLen = 0;
+    let i = 0;
+    for (;;) {
+      const part = this.headParts.get(i);
+      if (!part) break;
+      this.head.push(part);
+      this.headLen += part.length;
+      i++;
+    }
+    if (this.headLen >= Math.min(HEAD_WINDOW, size) || this.headLen >= size) {
+      if (size > 0 || this.headLen > 0) this.decide(size);
+    }
   }
 
   private decide(size: number): void {
