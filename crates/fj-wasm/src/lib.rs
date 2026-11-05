@@ -11,8 +11,8 @@
 
 use wasm_bindgen::prelude::*;
 
+use fj_protocol::FILE_ALL;
 use fj_protocol::session::{Action, Role, Session, SessionOpts};
-use fj_protocol::{ErrorCode, FILE_ALL};
 
 /// Actions as JSON values:
 /// `{t:"send",bytes}` | `{t:"saveChunk",file,index,data}` | `{t:"saveState"}`
@@ -367,7 +367,7 @@ impl FjCore {
         let secret = hex::decode(secret_hex).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let sid = fj_protocol::envelope::parse_sid(sid_hex).map_err(err_js)?;
         let k = fj_protocol::crypto::derive_root(&secret, &sid);
-        Ok(hex::encode(&*k))
+        Ok(hex::encode(*k))
     }
 
     /// TEST/parity: derive a direction/epoch key.
@@ -390,7 +390,7 @@ impl FjCore {
             other => return Err(JsValue::from_str(&format!("bad dir {other}"))),
         };
         let k = fj_protocol::crypto::derive_dir_key(&root, &sid, dir, epoch);
-        Ok(hex::encode(&*k))
+        Ok(hex::encode(*k))
     }
 
     /// TEST/parity: encrypt a frame payload exactly like the session does.
@@ -575,7 +575,7 @@ mod parity {
                 offer_sdp: OFFER.into(),
             })
             .unwrap();
-            let (mut rsp, blob2) =
+            let (rsp, blob2) =
                 Session::responder_join(&blob1, &pass, ANSWER, &mut limiter).unwrap();
             ini.initiator_accept(&blob2).unwrap();
             let empty_sha = sha256_hex(b"");
