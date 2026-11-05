@@ -1203,13 +1203,6 @@ fn probe_gzip(path: &Path, size: u64) -> Result<bool, ErrorCode> {
     Ok((comp as f64) < 0.9 * buf.len() as f64)
 }
 
-/// Count `m=application` sections in an SDP (number of SCTP data channels).
-fn count_sctp_streams(sdp: &str) -> usize {
-    sdp.lines()
-        .filter(|l| l.starts_with("m=application"))
-        .count()
-}
-
 /// Sequential read helper: seeks + reads a chunk range.
 struct TakeReader {
     f: std::fs::File,
