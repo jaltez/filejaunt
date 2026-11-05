@@ -688,7 +688,7 @@ impl Engine {
         let channels = count_sctp_streams(&env1.sdp.clone().unwrap_or_default()).max(1);
         let private3 = mode == fj_protocol::envelope::PairingMode::P3;
 
-        let mut session = match resume_sid {
+        let session = match resume_sid {
             None => {
                 let offer = env1.sdp.clone().unwrap_or_default();
                 let answer = peer
@@ -957,10 +957,10 @@ impl Engine {
                         eprintln!("verified: sha256 {}", hex::encode(sha256));
                     }
                 }
-                if let Some((path, _)) = rx.files.get(&file) {
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-                        let _ = f.sync_all();
-                    }
+                if let Some((path, _)) = rx.files.get(&file)
+                    && let Ok(f) = std::fs::OpenOptions::new().write(true).open(path)
+                {
+                    let _ = f.sync_all();
                 }
                 Ok(false)
             }
@@ -1079,12 +1079,11 @@ fn read_blob_field(mode: Mode, field: &str) -> Result<String, ErrorCode> {
         eprintln!("pairing input closed before the blob arrived (peer aborted?)");
         return Err(ErrorCode::SecPakeFailed);
     }
-    if mode == Mode::Json {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-            if let Some(b) = v[field].as_str() {
-                return Ok(b.to_string());
-            }
-        }
+    if mode == Mode::Json
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+        && let Some(b) = v[field].as_str()
+    {
+        return Ok(b.to_string());
     }
     Ok(t)
 }

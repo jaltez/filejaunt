@@ -53,7 +53,7 @@ impl Out {
         let pct = if total == 0 {
             100
         } else {
-            (done * 100 / total).min(100)
+            (done / total.div_ceil(100)).min(100)
         };
         let name_disp: String = name.chars().take(24).collect();
         eprint!(

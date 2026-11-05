@@ -1,6 +1,6 @@
 //! e2e: full CLI transfer over loopback host candidates (real DTLS/SCTP).
 
-use fj_e2e::cli::{PairOpts, bin_path, run_transfer, sha256_file};
+use fj_e2e::cli::{PairOpts, run_transfer, sha256_file};
 
 #[test]
 #[ignore] // e2e: run with `cargo test --test cli_transfer -- --ignored`

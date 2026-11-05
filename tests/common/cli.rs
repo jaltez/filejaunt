@@ -67,6 +67,7 @@ impl Shared {
     }
 }
 
+#[derive(Default)]
 pub struct PairOpts {
     pub sender_args: Vec<String>,
     pub receiver_args: Vec<String>,
@@ -76,18 +77,6 @@ pub struct PairOpts {
     pub receiver_passphrase: Option<String>,
     /// Kill the receiver once progress passes this fraction (0..1), None=off.
     pub kill_receiver_at: Option<f64>,
-}
-
-impl Default for PairOpts {
-    fn default() -> Self {
-        PairOpts {
-            sender_args: vec![],
-            receiver_args: vec![],
-            tamper_blob1: None,
-            receiver_passphrase: None,
-            kill_receiver_at: None,
-        }
-    }
 }
 
 pub struct PairOutcome {
@@ -130,8 +119,8 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
         tx_stdin: Mutex::new(sender.stdin.take()),
     });
 
-    let (line_tx, line_rx): (mpsc::SyncSender<(bool, String)>, Receiver<(bool, String)>) =
-        mpsc::sync_channel(4096);
+    type LineChan = (mpsc::SyncSender<(bool, String)>, Receiver<(bool, String)>);
+    let (line_tx, line_rx): LineChan = mpsc::sync_channel(4096);
     let main_tx = line_tx.clone();
 
     // reader threads: (is_receiver, line)
@@ -223,17 +212,17 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
     let mut scode = None;
     let mut rcode = None;
     loop {
-        if scode.is_none() {
-            if let Some(st) = sender.try_wait().unwrap() {
-                scode = st.code();
-                shared.close_all();
-            }
+        if scode.is_none()
+            && let Some(st) = sender.try_wait().unwrap()
+        {
+            scode = st.code();
+            shared.close_all();
         }
-        if rcode.is_none() {
-            if let Some(st) = receiver.try_wait().unwrap() {
-                rcode = st.code();
-                shared.close_all();
-            }
+        if rcode.is_none()
+            && let Some(st) = receiver.try_wait().unwrap()
+        {
+            rcode = st.code();
+            shared.close_all();
         }
         if scode.is_some() && rcode.is_some() {
             break;

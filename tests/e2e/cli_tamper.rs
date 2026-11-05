@@ -2,7 +2,7 @@
 //! SEC_HELLO_MISMATCH; wrong passphrase fails the sender with
 //! SEC_PAKE_FAILED.
 
-use fj_e2e::cli::{PairOpts, bin_path, run_transfer};
+use fj_e2e::cli::{PairOpts, run_transfer};
 
 /// Flip one character in the (clear) SDP carried inside blob-1: an attacker
 /// who controls the blob channel substitutes the offer. Both sides must
