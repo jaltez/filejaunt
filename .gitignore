@@ -1,0 +1,7 @@
+/target
+node_modules/
+dist/
+fixtures/big.bin
+playwright-report/
+test-results/
+*.local.*
