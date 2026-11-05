@@ -47,6 +47,8 @@ pub struct SessionOpts {
     pub private3: bool,
     /// Chunk size (CHUNK_SIZE_DEFAULT or negotiated CHUNK_SIZE_LARGE).
     pub chunk_size: u32,
+    /// Data channels to announce (1 or CHANNELS_MAX).
+    pub channels: usize,
     /// Deterministic sid (test vectors only; None = OsRng).
     pub sid: Option<[u8; 16]>,
     /// The offer SDP created by the glue BEFORE pairing starts.
@@ -59,6 +61,7 @@ impl Default for SessionOpts {
             words: WORDS_DEFAULT,
             private3: false,
             chunk_size: crate::CHUNK_SIZE_DEFAULT,
+            channels: 1,
             sid: None,
             offer_sdp: String::new(),
         }
@@ -190,6 +193,7 @@ pub struct Session {
     sid: [u8; 16],
     epoch: u32,
     private3: bool,
+    channels: usize,
     chunk_size: u32,
     passphrase: Zeroizing<String>,
     k_root: Option<Key32>,
@@ -238,6 +242,7 @@ impl Session {
         let sid = opts.sid.unwrap_or_else(crate::pake::new_sid);
         let mut s = Session::empty(Role::Initiator, sid, 0, opts.private3, &passphrase)?;
         s.chunk_size = opts.chunk_size;
+        s.channels = opts.channels.clamp(1, crate::CHANNELS_MAX);
         s.pair_start(&opts.offer_sdp)?;
         let blob1 = s.build_envelope1()?;
         Ok((s, passphrase, blob1))
@@ -590,6 +595,14 @@ impl Session {
         let frame = match self.decrypt(&header, &wire[12..]) {
             Ok(f) => f,
             Err(e) => {
+                if std::env::var("FJ_DEBUG").is_ok() {
+                    eprintln!(
+                        "[fj-debug pid={}] DECRYPT FAIL type=0x{:02x} seq={}",
+                        std::process::id(),
+                        wire[1],
+                        u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]])
+                    );
+                }
                 self.phase = Phase::Failed;
                 return Ok(vec![Action::Fail {
                     code: e.code(),
@@ -1292,13 +1305,12 @@ impl Session {
 
     /// Encrypt + advance the tx counter. Returns wire bytes.
     fn encrypt_frame(&mut self, frame: &Frame) -> Vec<u8> {
+        // D4: the header `seq` field carries the encryption counter for
+        // EVERY frame (chunk_index stays in the CHUNK payload), so frame
+        // decryption never depends on cross-channel arrival order.
+        let counter = self.tx_counter;
         let mut plain = Vec::new();
-        frame.encode(&mut plain, self.ctrl_seq);
-        if matches!(frame, Frame::Chunk { .. }) {
-            // seq field already carries the chunk index
-        } else {
-            self.ctrl_seq = self.ctrl_seq.wrapping_add(1);
-        }
+        frame.encode(&mut plain, counter);
         let mut header = [0u8; 12];
         header.copy_from_slice(&plain[..12]);
         let key = self.k_tx.as_ref().expect("keys derived");
@@ -1306,7 +1318,7 @@ impl Session {
             key,
             self.epoch,
             self.tx_dir(),
-            self.tx_counter,
+            counter,
             &header,
             &plain[12..],
         );
@@ -1328,7 +1340,8 @@ impl Session {
             );
         }
         let key = self.k_rx.as_ref().expect("keys").clone();
-        let counter = self.rx_counter;
+        // D4: the counter rides in the header seq field
+        let counter = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let pt = crypto::decrypt_frame(&key, self.epoch, self.rx_dir(), counter, header, ct)?;
         self.rx_counter = self.rx_counter.wrapping_add(1);
         let mut wire = header.to_vec();
@@ -1353,6 +1366,7 @@ impl Session {
             sid,
             epoch,
             private3,
+            channels: 1,
             chunk_size: crate::CHUNK_SIZE_DEFAULT,
             passphrase: Zeroizing::new(canonical),
             k_root: None,
@@ -1467,6 +1481,7 @@ impl Session {
             } else {
                 "p2".into()
             },
+            ch: self.channels,
         };
         crate::envelope::serialize(&env1)
     }
@@ -1575,6 +1590,7 @@ impl Session {
             sid,
             epoch: snap.epoch,
             private3: snap.private3,
+            channels: 1,
             chunk_size: snap
                 .manifest
                 .as_ref()

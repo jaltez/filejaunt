@@ -71,6 +71,7 @@ impl Loop {
             words: 6,
             private3,
             chunk_size: 16384,
+            channels: 1,
             sid: Some([9u8; 16]),
             offer_sdp: OFFER.to_string(),
         })

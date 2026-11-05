@@ -26,3 +26,7 @@ path = "e2e/cli_tamper.rs"
 [[test]]
 name = "cli_gzip"
 path = "e2e/cli_gzip.rs"
+
+[[test]]
+name = "p3"
+path = "e2e/p3.rs"

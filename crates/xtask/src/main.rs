@@ -68,6 +68,7 @@ fn gen_vectors() {
         sdp: Some(OFFER.into()),
         ep: EPOCH,
         mode: "p2".into(),
+        ch: 1,
     };
     let blob1 = fj_protocol::envelope::serialize(&env1).unwrap();
     let ct_answer = crypto::encrypt_sdp(&k_env_a, "sdp-answer", ANSWER);
@@ -214,6 +215,7 @@ fn gen_vectors() {
         words: 6,
         private3: false,
         chunk_size: CHUNK_SIZE,
+        channels: 1,
         sid: Some(SID),
         offer_sdp: OFFER.into(),
     })

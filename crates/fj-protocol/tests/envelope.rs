@@ -18,6 +18,7 @@ fn roundtrip_env1_p2() {
         sdp: Some("v=0 offer".into()),
         ep: 0,
         mode: "p2".into(),
+        ch: 1,
     };
     let raw = fj_protocol::envelope::serialize(&e).unwrap();
     assert!(raw.starts_with("FJ1."));
@@ -71,6 +72,7 @@ fn opts_p2() -> SessionOpts {
         words: 6,
         private3: false,
         chunk_size: 16384,
+        channels: 1,
         sid: Some([3u8; 16]),
         offer_sdp: OFFER.into(),
     }
@@ -81,6 +83,7 @@ fn opts_p3() -> SessionOpts {
         words: 6,
         private3: true,
         chunk_size: 16384,
+        channels: 1,
         sid: Some([3u8; 16]),
         offer_sdp: OFFER.into(),
     }

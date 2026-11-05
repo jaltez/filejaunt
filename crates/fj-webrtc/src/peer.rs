@@ -77,6 +77,9 @@ struct PeerState {
     expected: AtomicUsize,
     opened: AtomicUsize,
     connected: AtomicBool,
+    /// set when the connection dies (failed/closed/disconnected): sends and
+    /// waits fail fast instead of polling forever
+    dead: AtomicBool,
     notify: Notify,
 }
 
@@ -124,8 +127,29 @@ impl PeerHandle {
             expected: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
             connected: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
             notify: Notify::new(),
         });
+
+        // connection liveness: mark the peer dead so the transfer loop stops
+        {
+            let state = state.clone();
+            pc.on_peer_connection_state_change(Box::new(move |st| {
+                let state = state.clone();
+                Box::pin(async move {
+                    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                    if matches!(
+                        st,
+                        RTCPeerConnectionState::Failed
+                            | RTCPeerConnectionState::Closed
+                            | RTCPeerConnectionState::Disconnected
+                    ) {
+                        state.dead.store(true, Ordering::SeqCst);
+                        state.notify.notify_waiters();
+                    }
+                })
+            }));
+        }
 
         if std::env::var("FJ_DEBUG").is_ok() {
             pc.on_ice_connection_state_change(Box::new(|st| {
@@ -146,6 +170,13 @@ impl PeerHandle {
             pc.on_data_channel(Box::new(move |dc| {
                 let state = state.clone();
                 Box::pin(async move {
+                    if std::env::var("FJ_DEBUG").is_ok() {
+                        eprintln!(
+                            "[fj-debug pid={}] on_data_channel label={:?}",
+                            std::process::id(),
+                            dc.label()
+                        );
+                    }
                     if let Some(idx) = channel_index(dc.label()) {
                         wire_channel(&dc, idx, &state);
                         let mut channels = state.channels.lock().await;
@@ -271,8 +302,14 @@ impl PeerHandle {
     }
 
     /// Send bytes on channel `ch`, honoring the backpressure watermark.
+    /// Fails fast once the connection is dead, or when the queue stays above
+    /// the watermark for 15 s (dead peers can buffer silently forever).
     pub async fn send_backpressured(&self, ch: usize, bytes: Vec<u8>) -> PResult<usize> {
+        let stalled_for = std::time::Instant::now();
         loop {
+            if self.state.dead.load(Ordering::SeqCst) {
+                return Err(PeerError::Failed);
+            }
             let dc = self
                 .state
                 .channels
@@ -285,8 +322,16 @@ impl PeerHandle {
             if (dc.buffered_amount().await as u64) < BACKPRESSURE_HIGH_BYTES {
                 return Ok(dc.send(&bytes.into()).await?);
             }
+            if stalled_for.elapsed() > Duration::from_secs(15) {
+                return Err(PeerError::Failed);
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// True once the connection failed/closed/disconnected.
+    pub fn is_dead(&self) -> bool {
+        self.state.dead.load(Ordering::SeqCst)
     }
 
     pub async fn buffered_amount(&self, ch: usize) -> PResult<usize> {
@@ -396,6 +441,45 @@ fn selected_candidate_type(report: &StatsReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loopback_4_channels() {
+        let a = PeerHandle::new(&IceConfig::default()).await.unwrap();
+        let b = PeerHandle::new(&IceConfig::default()).await.unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // CLI ordering: callbacks registered AFTER pairing (like the engine)
+        let offer = a.create_offer(4).await.unwrap();
+        let answer = b.accept_offer(&offer, 4).await.unwrap();
+        for ch in 0..4 {
+            let tx = tx.clone();
+            b.on_frame(ch, move |bytes| {
+                let _ = tx.send(bytes);
+            })
+            .await;
+        }
+        a.set_answer(&answer).await.unwrap();
+        a.wait_channels_open(Duration::from_secs(10)).await.unwrap();
+        b.wait_channels_open(Duration::from_secs(10)).await.unwrap();
+        for i in 0..40u32 {
+            let ch = (i as usize) % 4;
+            let msg = format!("{ch}:{i}").into_bytes();
+            a.send_backpressured(ch, msg).await.unwrap();
+        }
+        let chans = tokio::task::spawn_blocking(move || {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..40 {
+                if let Ok(m) = rx.recv_timeout(Duration::from_secs(15)) {
+                    seen.insert(m[0] as char);
+                }
+            }
+            seen
+        })
+        .await
+        .unwrap();
+        assert_eq!(chans.len(), 4, "all 4 channels delivered: {chans:?}");
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn loopback_host_candidates() {

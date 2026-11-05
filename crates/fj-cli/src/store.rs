@@ -40,22 +40,27 @@ impl Store {
         Ok(())
     }
 
-    /// Save a session snapshot (`sessions/<sid>.json`).
-    pub fn save_session(&self, sid: &str, snapshot: &str) -> std::io::Result<()> {
+    /// Save a session snapshot (`sessions/<sid>.<role>.json`); the sender
+    /// and receiver of one sid keep separate files.
+    pub fn save_session(&self, sid: &str, role: &str, snapshot: &str) -> std::io::Result<()> {
         let sid: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let role = if role == "send" { "send" } else { "recv" };
         Self::write_atomic(
-            &self.sessions_dir().join(format!("{sid}.json")),
+            &self.sessions_dir().join(format!("{sid}.{role}.json")),
             snapshot.as_bytes(),
         )
     }
 
-    pub fn load_session(&self, sid: &str) -> Option<String> {
+    pub fn load_session(&self, sid: &str, role: &str) -> Option<String> {
         let sid: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-        std::fs::read_to_string(self.sessions_dir().join(format!("{sid}.json"))).ok()
+        let role = if role == "send" { "send" } else { "recv" };
+        std::fs::read_to_string(self.sessions_dir().join(format!("{sid}.{role}.json"))).ok()
     }
 
     pub fn delete_session(&self, sid: &str) {
         let sid: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let _ = std::fs::remove_file(self.sessions_dir().join(format!("{sid}.send.json")));
+        let _ = std::fs::remove_file(self.sessions_dir().join(format!("{sid}.recv.json")));
         let _ = std::fs::remove_file(self.sessions_dir().join(format!("{sid}.json")));
     }
 

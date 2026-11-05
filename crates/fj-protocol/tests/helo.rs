@@ -15,6 +15,7 @@ fn opts() -> SessionOpts {
         words: 6,
         private3: false,
         chunk_size: 16384,
+        channels: 1,
         sid: Some([8u8; 16]),
         offer_sdp: OFFER.into(),
     }

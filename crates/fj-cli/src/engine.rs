@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
-use fj_protocol::ErrorCode;
 use fj_protocol::manifest::FileSpec;
 use fj_protocol::pake::AttemptLimiter;
 use fj_protocol::session::{Action, Session, SessionOpts};
+use fj_protocol::{ErrorCode, FILE_ALL};
 use fj_webrtc::{IceConfig, PeerHandle};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -71,6 +71,24 @@ pub struct Engine {
     pub channels: usize,
     pub yes: bool,
     pub passphrase_prompt: Option<String>, // resume: passphrase known up-front
+    /// file id -> absolute source path (sender side; used to wrap state)
+    pub sources: std::cell::RefCell<Vec<PathBuf>>,
+}
+
+impl Engine {
+    /// Sender state wrapper: session snapshot + source paths (receiver state
+    /// is stored as the plain snapshot).
+    fn wrap_sender_state(&self, _sid: &str, session: &Session, sources: &[PathBuf]) -> String {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&session.snapshot()).unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "v": 1,
+            "role": "sender",
+            "sources": sources.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "session": snapshot,
+        })
+        .to_string()
+    }
 }
 
 /// Read a trimmed line from stdin; hidden prompt when interactive.
@@ -159,6 +177,14 @@ async fn wire_frames(peer: &Arc<PeerHandle>, channels: usize) -> std_mpsc::Recei
     for ch in 0..channels.max(1) {
         let tx = tx.clone();
         peer.on_frame(ch, move |bytes| {
+            if std::env::var("FJ_DEBUG").is_ok() && bytes.len() > 12 {
+                eprintln!(
+                    "[fj-debug pid={}] ch{ch} delivered type=0x{:02x} seq={}",
+                    std::process::id(),
+                    bytes[1],
+                    u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+                );
+            }
             let _ = tx.send(bytes);
         })
         .await;
@@ -181,7 +207,36 @@ impl Engine {
         receivers: usize,
         resume: Option<(&str, &str)>,
     ) -> Result<Outcome, ErrorCode> {
-        let listing = collect_files(paths).map_err(|_| ErrorCode::StorageFailed)?;
+        let listing = if let Some((sid, _pass)) = resume {
+            // sender resume: source paths come from the saved state
+            let raw = self
+                .store
+                .load_session(sid, "send")
+                .ok_or(ErrorCode::StorageFailed)?;
+            let wrapper: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|_| ErrorCode::StorageFailed)?;
+            wrapper["sources"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .collect::<Vec<PathBuf>>()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.clone(),
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        String::new(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            collect_files(paths).map_err(|_| ErrorCode::StorageFailed)?
+        };
         if listing.is_empty() {
             eprintln!("nothing to send");
             return Err(ErrorCode::StorageFailed);
@@ -195,6 +250,7 @@ impl Engine {
             return Err(ErrorCode::PathRejected);
         }
 
+        *self.sources.borrow_mut() = listing.iter().map(|(p, _, _)| p.clone()).collect();
         // file specs (hash + gzip probe) computed once, shared by receivers
         let mut locals: Vec<LocalFile> = Vec::with_capacity(listing.len());
         for (path, name, dir) in &listing {
@@ -237,24 +293,28 @@ impl Engine {
             ctxs.push(ctx);
         }
 
-        // manifests: same file list for every receiver session
-        let specs: Vec<FileSpec> = locals.iter().map(|l| l.spec.clone()).collect();
-        for ctx in &mut ctxs {
-            ctx.session.set_files(&specs).map_err(|e| {
-                eprintln!("manifest rejected: {}", e.msg());
-                ErrorCode::PathRejected
-            })?;
+        // manifests: same file list for every receiver session. On resume the
+        // restored session already carries the manifest + bitmaps.
+        if resume.is_none() {
+            let specs: Vec<FileSpec> = locals.iter().map(|l| l.spec.clone()).collect();
+            for ctx in &mut ctxs {
+                ctx.session.set_files(&specs).map_err(|e| {
+                    eprintln!("manifest rejected: {}", e.msg());
+                    ErrorCode::PathRejected
+                })?;
+            }
         }
 
+        if std::env::var("FJ_DEBUG").is_ok() {
+            eprintln!(
+                "[fj-debug pid={}] send: {} sessions",
+                std::process::id(),
+                ctxs.len()
+            );
+        }
         // open channels for every receiver (wait for the wire first: HELO
         // must not race the channel open)
         for ctx in &mut ctxs {
-            if std::env::var("FJ_DEBUG").is_ok() {
-                eprintln!(
-                    "[fj-debug pid={}] sender: waiting channels open",
-                    std::process::id()
-                );
-            }
             ctx.peer
                 .wait_channels_open(Duration::from_secs(20))
                 .await
@@ -262,20 +322,7 @@ impl Engine {
                     eprintln!("data channel did not open (ICE failed?)");
                     ErrorCode::IceFailed
                 })?;
-            if std::env::var("FJ_DEBUG").is_ok() {
-                eprintln!(
-                    "[fj-debug pid={}] sender: channels open",
-                    std::process::id()
-                );
-            }
             let actions = ctx.session.on_channel_open();
-            if std::env::var("FJ_DEBUG").is_ok() {
-                eprintln!(
-                    "[fj-debug pid={}] sender: on_channel_open -> {} actions",
-                    std::process::id(),
-                    actions.len()
-                );
-            }
             for a in actions {
                 self.route_sender(ctx, a).await?;
             }
@@ -284,7 +331,8 @@ impl Engine {
         self.emit_manifest(&locals, total);
 
         let pause_flag = Arc::new(AtomicBool::new(false));
-        crate::signals::install(pause_flag.clone());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        crate::signals::install(pause_flag.clone(), cancel_flag.clone());
 
         let mut readers: Vec<TakeReader> = Vec::with_capacity(locals.len());
         for l in &locals {
@@ -292,7 +340,7 @@ impl Engine {
             readers.push(TakeReader::new(f));
         }
 
-        self.drive_sender(&mut ctxs, &locals, &mut readers, &pause_flag)
+        self.drive_sender(&mut ctxs, &locals, &mut readers, &pause_flag, &cancel_flag)
             .await?;
         for ctx in &ctxs {
             self.store.delete_session(&ctx.sid);
@@ -321,6 +369,7 @@ impl Engine {
                 words,
                 private3,
                 chunk_size: fj_protocol::CHUNK_SIZE_DEFAULT,
+                channels: self.channels,
                 sid: None,
                 offer_sdp,
             })
@@ -329,10 +378,19 @@ impl Engine {
                 ErrorCode::SecPakeFailed
             })?,
             Some((sid, pass)) => {
-                let snap = self
+                let raw = self
                     .store
-                    .load_session(sid)
+                    .load_session(sid, "send")
                     .ok_or(ErrorCode::StorageFailed)?;
+                // sender state is stored as {role, sources, session{...}}
+                let snap = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|w| {
+                        w.get("session")
+                            .map(|s| s.to_string())
+                            .filter(|s| s != "null")
+                    })
+                    .unwrap_or(raw);
                 let mut s = Session::restore(&snap).map_err(|e| {
                     eprintln!("bad session state: {}", e.msg());
                     ErrorCode::StorageFailed
@@ -365,13 +423,6 @@ impl Engine {
         }
 
         let blob2 = read_blob_field(self.out.mode, "blob2")?;
-        if std::env::var("FJ_DEBUG").is_ok() {
-            eprintln!(
-                "[fj-debug pid={}] got blob2 ({} bytes)",
-                std::process::id(),
-                blob2.len()
-            );
-        }
         session.initiator_accept(&blob2).map_err(|e| {
             eprintln!("[{}] pairing failed: {}", e.code(), e.msg());
             ErrorCode::SecPakeFailed
@@ -469,9 +520,9 @@ impl Engine {
                 Ok(false)
             }
             Action::SaveState => {
-                self.store
-                    .save_session(&ctx.sid, &ctx.session.snapshot())
-                    .ok();
+                let wrapped =
+                    self.wrap_sender_state(&ctx.sid, &ctx.session, &self.sources.borrow());
+                self.store.save_session(&ctx.sid, "send", &wrapped).ok();
                 Ok(false)
             }
             Action::Progress {
@@ -550,8 +601,11 @@ impl Engine {
         locals: &[LocalFile],
         readers: &mut [TakeReader],
         pause_flag: &Arc<AtomicBool>,
+        cancel_flag: &Arc<AtomicBool>,
     ) -> Result<(), ErrorCode> {
         let mut done_count = 0usize;
+        let mut was_paused = false;
+        let mut last_activity = std::time::Instant::now();
         loop {
             // 1) drain inbound frames
             for ctx in ctxs.iter_mut() {
@@ -579,9 +633,48 @@ impl Engine {
             if done_count >= ctxs.len() {
                 return Ok(());
             }
+            if cancel_flag.load(Ordering::SeqCst) {
+                // SIGINT/SIGTERM: clean cancel, exit 0
+                for ctx in ctxs.iter_mut() {
+                    for a in ctx.session.cancel(FILE_ALL) {
+                        let _ = self.route_sender(ctx, a).await;
+                    }
+                }
+                self.out
+                    .json(serde_json::json!({"type": "done", "ok": false, "cancelled": true}));
+                return Ok(());
+            }
             if pause_flag.load(Ordering::SeqCst) {
+                if !was_paused {
+                    was_paused = true;
+                    for ctx in ctxs.iter_mut() {
+                        for a in ctx.session.pause(FILE_ALL) {
+                            if let Action::Send(bytes) = a {
+                                let _ = ctx.peer.send_backpressured(0, bytes).await;
+                            }
+                        }
+                    }
+                    match self.out.mode {
+                        Mode::Json => self.out.json(serde_json::json!({"type": "paused"})),
+                        Mode::Human => eprintln!("paused"),
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
+            }
+            if was_paused {
+                was_paused = false;
+                for ctx in ctxs.iter_mut() {
+                    for a in ctx.session.resume(FILE_ALL) {
+                        if let Action::Send(bytes) = a {
+                            let _ = ctx.peer.send_backpressured(0, bytes).await;
+                        }
+                    }
+                }
+                match self.out.mode {
+                    Mode::Json => self.out.json(serde_json::json!({"type": "resumed"})),
+                    Mode::Human => eprintln!("resumed"),
+                }
             }
             // 2) push one chunk per receiver per round (shared disk read)
             let mut pushed = 0usize;
@@ -642,8 +735,17 @@ impl Engine {
                     break; // one chunk per receiver per round
                 }
             }
+            if pushed > 0 {
+                last_activity = std::time::Instant::now();
+            }
             if pushed == 0 {
                 tokio::time::sleep(Duration::from_millis(15)).await;
+                // stall watchdog: a dead peer can leave SCTP silently
+                // buffering forever; fail after 15 s without progress
+                if last_activity.elapsed() > Duration::from_secs(15) {
+                    eprintln!("connection stalled (no progress for 15s)");
+                    return Err(ErrorCode::IceFailed);
+                }
             }
             // allow tokio to breathe under heavy loops
             tokio::task::yield_now().await;
@@ -685,7 +787,7 @@ impl Engine {
             eprintln!("[{}] {}", e.code(), e.msg());
             ErrorCode::ProtoMalformed
         })?;
-        let channels = count_sctp_streams(&env1.sdp.clone().unwrap_or_default()).max(1);
+        let channels = env1.ch.clamp(1, fj_protocol::CHANNELS_MAX);
         let private3 = mode == fj_protocol::envelope::PairingMode::P3;
 
         let session = match resume_sid {
@@ -712,8 +814,8 @@ impl Engine {
             Some(sid_hex) => {
                 let snap = self
                     .store
-                    .load_session(sid_hex)
-                    .or_else(|| self.store.load_session(&hex::encode(sid)))
+                    .load_session(sid_hex, "recv")
+                    .or_else(|| self.store.load_session(&hex::encode(sid), "recv"))
                     .ok_or(ErrorCode::StorageFailed)?;
                 let mut s = Session::restore(&snap).map_err(|e| {
                     eprintln!("bad session state: {}", e.msg());
@@ -974,7 +1076,7 @@ impl Engine {
             }
             Action::SaveState => {
                 self.store
-                    .save_session(&rx.sid, &rx.session.snapshot())
+                    .save_session(&rx.sid, "recv", &rx.session.snapshot())
                     .ok();
                 Ok(false)
             }
@@ -1019,10 +1121,13 @@ impl Engine {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            // never truncate here: a resumed file keeps its earlier chunks
+            // (final length is fixed on completion); a fresh receive
+            // overwrites every chunk anyway
             let f = std::fs::OpenOptions::new()
                 .create(true)
-                .truncate(true)
                 .write(true)
+                .truncate(false)
                 .open(&path)
                 .ok();
             (path, f)

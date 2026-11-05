@@ -39,6 +39,15 @@ pub struct Envelope1 {
     pub ep: u32,
     /// "p2" | "p3".
     pub mode: String,
+    /// Data channel count the initiator created (default 1). The answer side
+    /// cannot learn it from the SDP (all SCTP streams share one
+    /// m=application section).
+    #[serde(default = "one_channel")]
+    pub ch: usize,
+}
+
+fn one_channel() -> usize {
+    1
 }
 
 /// Envelope 2 (responder -> initiator).

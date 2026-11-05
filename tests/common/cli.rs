@@ -77,6 +77,17 @@ pub struct PairOpts {
     pub receiver_passphrase: Option<String>,
     /// Kill the receiver once progress passes this fraction (0..1), None=off.
     pub kill_receiver_at: Option<f64>,
+    /// Send a signal to the sender once progress passes this fraction:
+    /// (fraction, signal number e.g. SIGUSR1=10).
+    pub signal_sender_at: Option<(f64, i32)>,
+    /// Second signal, sent 3 s after the first (e.g. SIGUSR2 resume).
+    pub signal_sender_at2: Option<(f64, i32)>,
+    /// Replace the whole sender command (e.g. `resume <sid> --send`).
+    pub sender_cmd: Option<Vec<String>>,
+    /// Replace the whole receiver command (e.g. `resume <sid>`).
+    pub receiver_cmd: Option<Vec<String>>,
+    /// Passphrase written to the SENDER stdin up-front (resume --send).
+    pub sender_passphrase: Option<String>,
 }
 
 pub struct PairOutcome {
@@ -88,31 +99,48 @@ pub struct PairOutcome {
 
 pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcome {
     let mut sender_cmd = Command::new(bin_path());
+    if let Some(cmd) = &opts.sender_cmd {
+        sender_cmd.args(cmd);
+    } else {
+        sender_cmd
+            .arg("send")
+            .args(paths)
+            .arg("--json")
+            .arg("--stun")
+            .arg("none")
+            .args(&opts.sender_args);
+    }
     sender_cmd
-        .arg("send")
-        .args(paths)
-        .arg("--json")
-        .arg("--stun")
-        .arg("none")
-        .args(&opts.sender_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut receiver_cmd = Command::new(bin_path());
+    if let Some(cmd) = &opts.receiver_cmd {
+        receiver_cmd.args(cmd);
+    } else {
+        receiver_cmd
+            .arg("receive")
+            .arg("--out")
+            .arg(out_dir)
+            .arg("--json")
+            .arg("--yes")
+            .arg("--stun")
+            .arg("none")
+            .args(&opts.receiver_args);
+    }
     receiver_cmd
-        .arg("receive")
-        .arg("--out")
-        .arg(out_dir)
-        .arg("--json")
-        .arg("--yes")
-        .arg("--stun")
-        .arg("none")
-        .args(&opts.receiver_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut sender = sender_cmd.spawn().expect("spawn sender");
+    if let Some(pass) = &opts.sender_passphrase {
+        use std::io::Write;
+        if let Some(stdin) = sender.stdin.as_mut() {
+            let _ = writeln!(stdin, "{pass}");
+            let _ = stdin.flush();
+        }
+    }
     let mut receiver = receiver_cmd.spawn().expect("spawn receiver");
     let shared = Arc::new(Shared {
         rx_stdin: Mutex::new(receiver.stdin.take()),
@@ -143,7 +171,12 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
     let mut passphrase = String::new();
     let mut sid = String::new();
     let kill_at = opts.kill_receiver_at;
+    let signal_at = opts.signal_sender_at;
+    let receiver_pid = receiver.id() as i32;
+    let sender_pid = sender.id() as i32;
     let mut killed = false;
+    let mut signaled = false;
+    let signal_at2 = opts.signal_sender_at2;
 
     // single routing loop
     let shared_router = shared.clone();
@@ -165,16 +198,40 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
                     }
                     "blob4" => shared_router.write_to(false, &line),
                     "progress" => {
-                        if let Some(limit) = kill_at
-                            && !killed
-                            && let (Some(done), Some(total)) = (
-                                parsed.as_ref().unwrap()["done"].as_u64(),
-                                parsed.as_ref().unwrap()["total"].as_u64(),
-                            )
+                        if let Some(done) = parsed.as_ref().unwrap()["done"].as_u64()
+                            && let Some(total) = parsed.as_ref().unwrap()["total"].as_u64()
                             && total > 0
-                            && done as f64 / total as f64 >= limit
                         {
-                            killed = true;
+                            let frac = done as f64 / total as f64;
+                            if let Some(limit) = kill_at
+                                && !killed
+                                && frac >= limit
+                            {
+                                killed = true;
+                                unsafe {
+                                    libc_kill(receiver_pid, 9);
+                                }
+                            }
+                            if let Some((limit, sig)) = signal_at
+                                && !signaled
+                                && frac >= limit
+                            {
+                                signaled = true;
+                                unsafe {
+                                    libc_kill(sender_pid, sig);
+                                }
+                                // second signal fires on a timer (progress
+                                // stops while paused)
+                                if let Some((_, sig2)) = signal_at2 {
+                                    let pid = sender_pid;
+                                    thread::spawn(move || {
+                                        thread::sleep(std::time::Duration::from_secs(3));
+                                        unsafe {
+                                            libc_kill(pid, sig2);
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -207,33 +264,39 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
         (sender_lines, receiver_lines, passphrase, sid)
     });
 
-    // wait for both; as soon as one exits, close BOTH stdins so the peer's
-    // blob read hits EOF and fails fast instead of hanging
-    let mut scode = None;
-    let mut rcode = None;
-    loop {
-        if scode.is_none()
-            && let Some(st) = sender.try_wait().unwrap()
-        {
-            scode = st.code();
-            shared.close_all();
-        }
-        if rcode.is_none()
-            && let Some(st) = receiver.try_wait().unwrap()
-        {
-            rcode = st.code();
-            shared.close_all();
-        }
-        if scode.is_some() && rcode.is_some() {
-            break;
-        }
-        thread::sleep(std::time::Duration::from_millis(100));
+    // wait for both via blocking wait-threads (try_wait proved unreliable
+    // here); as soon as one exits, close BOTH stdins so the peer's blob read
+    // hits EOF and fails fast instead of hanging
+    let (done_tx, done_rx) = mpsc::channel::<(bool, i32)>();
+    {
+        let tx = done_tx.clone();
+        thread::spawn(move || {
+            let code = sender.wait().ok().and_then(|st| st.code()).unwrap_or(-1);
+            let _ = tx.send((false, code));
+        });
     }
+    {
+        let tx = done_tx.clone();
+        thread::spawn(move || {
+            let code = receiver.wait().ok().and_then(|st| st.code()).unwrap_or(-1);
+            let _ = tx.send((true, code));
+        });
+    }
+    let mut scode: Option<i32> = None;
+    let mut rcode: Option<i32> = None;
+    while scode.is_none() || rcode.is_none() {
+        let (is_receiver, code) = done_rx.recv().unwrap_or((true, -1));
+        if is_receiver {
+            rcode = Some(code);
+        } else {
+            scode = Some(code);
+        }
+        shared.close_all();
+    }
+    let (scode, rcode) = (scode.unwrap_or(-1), rcode.unwrap_or(-1));
     if std::env::var("FJ_E2E_DEBUG").is_ok() {
-        eprintln!("[e2e] children exited: sender={scode:?} receiver={rcode:?}");
+        eprintln!("[e2e] children exited: sender={scode} receiver={rcode}");
     }
-    let scode = scode.unwrap_or(-1);
-    let rcode = rcode.unwrap_or(-1);
     drop(main_tx);
     drop(line_tx);
     let _ = killed;
@@ -263,6 +326,23 @@ pub fn run_transfer(paths: &[&str], out_dir: &str, opts: PairOpts) -> PairOutcom
 
 /// Read stderr of a finished child is not possible post-wait with piped
 /// stderr; tests that need stderr assertions spawn their own processes.
+#[cfg(target_os = "linux")]
+unsafe fn libc_kill(pid: i32, sig: i32) {
+    // direct syscall via std (no libc dependency in the test package)
+    let r = std::process::Command::new("kill")
+        .args([
+            "-9".to_string().replace('9', &sig.to_string()),
+            pid.to_string(),
+        ])
+        .status();
+    let _ = r;
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn libc_kill(pid: i32, sig: i32) {
+    let _ = (pid, sig);
+}
+
 pub fn sha256_file(path: &str) -> String {
     use sha2::Digest;
     let mut f = std::fs::File::open(path).unwrap();

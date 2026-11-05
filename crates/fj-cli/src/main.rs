@@ -204,6 +204,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                 channels: channels as usize,
                 yes: true,
                 passphrase_prompt: None,
+                sources: std::cell::RefCell::new(vec![]),
             };
             match engine
                 .send(
@@ -236,6 +237,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                 channels: 1,
                 yes,
                 passphrase_prompt: None,
+                sources: std::cell::RefCell::new(vec![]),
             };
             match engine.receive(&dir, None).await {
                 Ok(_) => 0,
@@ -253,13 +255,14 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
             yes,
             send,
         } => {
-            let passphrase =
-                engine::read_line_prompt("passphrase (same as the original session): ");
-            if passphrase.is_empty() {
-                eprintln!("no passphrase given");
-                return 3;
-            }
             if send {
+                // sender resume: no blob to read first, prompt up-front
+                let passphrase =
+                    engine::read_line_prompt("passphrase (same as the original session): ");
+                if passphrase.is_empty() {
+                    eprintln!("no passphrase given");
+                    return 3;
+                }
                 let engine = Engine {
                     out,
                     store,
@@ -267,6 +270,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                     channels: 1,
                     yes: true,
                     passphrase_prompt: Some(passphrase),
+                    sources: std::cell::RefCell::new(vec![]),
                 };
                 // sender resume: no paths needed, manifest comes from state
                 match engine
@@ -293,7 +297,8 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                     ice: ice_from(&stun, &turn),
                     channels: 1,
                     yes,
-                    passphrase_prompt: Some(passphrase),
+                    passphrase_prompt: None,
+                    sources: std::cell::RefCell::new(vec![]),
                 };
                 match engine.receive(&dir, Some(&sid)).await {
                     Ok(_) => 0,
@@ -310,8 +315,19 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                 Some(s) => engine::parse_stun(s),
             };
             if urls.is_empty() {
-                eprintln!("doctor needs at least one STUN server (--stun public)");
-                return 2;
+                // --stun none: no probe possible, report and exit cleanly
+                match out.mode {
+                    Mode::Json => out.json(serde_json::json!({
+                        "type": "doctor", "class": "UNKNOWN",
+                        "results": [], "description":
+                        "no STUN servers configured; LAN-direct sessions still work with host candidates",
+                    })),
+                    Mode::Human => {
+                        println!("UNKNOWN (no STUN servers configured)");
+                        println!("LAN-direct sessions still work with host candidates");
+                    }
+                }
+                return 0;
             }
             let results = fj_webrtc::stun::stun_probe(&urls);
             let class = fj_webrtc::classify(&results);

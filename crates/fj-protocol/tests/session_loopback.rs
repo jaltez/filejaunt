@@ -201,6 +201,7 @@ fn resume_after_interruption_epoch_bump() {
         words: 6,
         private3: false,
         chunk_size: 16384,
+        channels: 1,
         sid: Some(sid),
         offer_sdp: OFFER.into(),
     })

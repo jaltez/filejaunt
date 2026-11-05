@@ -35,7 +35,7 @@ fn cli_transfer_50mib() {
     assert_eq!(path[0]["kind"], "direct");
 
     // receipt exists and verifies with the passphrase
-    let receipts = std::fs::read_dir(
+    let mut receipts = std::fs::read_dir(
         std::env::var("HOME")
             .map(|h| format!("{h}/.local/share/filejaunt/receipts"))
             .unwrap(),
@@ -45,11 +45,12 @@ fn cli_transfer_50mib() {
     .map(|e| e.path())
     .filter(|p| {
         let t = p.metadata().ok().and_then(|m| m.modified().ok());
-        matches!(t, Some(t) if t.elapsed().map(|e| e.as_secs() < 120).unwrap_or(false))
+        matches!(t, Some(t) if t.elapsed().map(|e| e.as_secs() < 300).unwrap_or(false))
     })
     .collect::<Vec<_>>();
+    receipts.sort_by_key(|p| std::cmp::Reverse(p.metadata().ok().and_then(|m| m.modified().ok())));
     assert!(!receipts.is_empty(), "a fresh receipt was saved");
-    let v = std::process::Command::new(fj_e2e::cli::BIN)
+    let v = std::process::Command::new(fj_e2e::cli::bin_path())
         .args(["verify", "--receipt"])
         .arg(receipts[0].to_str().unwrap())
         .stdin(std::process::Stdio::piped())
