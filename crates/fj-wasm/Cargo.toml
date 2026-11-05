@@ -1,0 +1,30 @@
+[package]
+name = "fj-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "filejaunt WASM facade over fj-protocol for the web client"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fj-protocol = { path = "../fj-protocol" }
+wasm-bindgen = "0.2.130"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# NOTE (dep note, allowed by plan): serde-wasm-bindgen converts action values
+# into plain JS objects for takeActions(); wasm-bindgen's from_serde is gone.
+serde-wasm-bindgen = "0.6"
+hex = "0.4"
+base64 = "0.22"
+# getrandom with the js feature so rand/OsRng compiles for wasm32-unknown-unknown
+# getrandom wasm backends: 0.3 (rand 0.9) via wasm_js + backend cfg, and 0.2
+# (rand_core 0.6 under aes-gcm/spake2) via its js feature
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+

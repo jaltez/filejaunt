@@ -50,7 +50,7 @@ pub struct Manifest {
 
 /// Input for building a manifest entry (glue provides these; sha256 must be
 /// computed over the real file content).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileSpec {
     pub name: String,
     pub path: String,

@@ -224,10 +224,18 @@ pub struct Session {
 }
 
 fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SystemTime is unavailable on wasm32-unknown-unknown
+        (js_sys::Date::now() / 1000.0) as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
 }
 
 impl Session {
