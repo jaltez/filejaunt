@@ -1,0 +1,28 @@
+[package]
+name = "fj-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "filejaunt core protocol: framing, crypto, PAKE, manifest, transfer state machine (sans-IO, pure)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes-gcm = "0.10"
+spake2 = "0.4"
+rand = "0.9"
+zeroize = "1"
+subtle = "2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+thiserror = "2"
+base64 = "0.22"
+hex = "0.4"
+# NOTE (dep note, allowed by plan): unicode-normalization is required to implement the
+# NFKD passphrase canonicalization mandated by the protocol spec (P1.4). Pure, no_std-capable.
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+proptest = "1"
