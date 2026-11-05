@@ -8,3 +8,4 @@ test-results/
 crates/fj-wasm/pkg/
 web/dist/
 .omp/
+fuzz/target/
