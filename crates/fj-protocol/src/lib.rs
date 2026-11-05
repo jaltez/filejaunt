@@ -18,7 +18,7 @@ pub mod words;
 pub use bitmap::Bitmap;
 pub use error::{Error, ErrorCode};
 pub use frame::{Frame, FrameType};
-pub use manifest::{FileEntry, Manifest, GzipPolicy};
+pub use manifest::{FileEntry, GzipPolicy, Manifest};
 pub use receipt::{Receipt, ReceiptMsg};
 pub use session::{Action, Role, Session, SessionOpts};
 

@@ -12,12 +12,11 @@
 
 use std::collections::HashMap;
 
-use rand::RngCore;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::error::{err, ErrorCode, Result};
 use crate::PAKE_ATTEMPT_LIMIT;
+use crate::error::{ErrorCode, Result, err};
 
 pub const PAKE_MSG_LEN: usize = 1 + 32; // side byte + Ed25519 point
 
@@ -51,9 +50,7 @@ pub fn canonical_passphrase(input: &str) -> String {
 
 /// Fresh 16-byte session id from OsRng.
 pub fn new_sid() -> [u8; 16] {
-    let mut sid = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut sid);
-    sid
+    rand::random()
 }
 
 /// A started SPAKE2 exchange. `message()` is the public PAKE message for the
@@ -69,14 +66,20 @@ impl PakeSide {
         let id = Identity::new(sid);
         let (ctx, msg) =
             Spake2::<Ed25519Group>::start_a(&Password::new(passphrase_canonical), &id, &id);
-        PakeSide { inner: Some(ctx), message: msg }
+        PakeSide {
+            inner: Some(ctx),
+            message: msg,
+        }
     }
 
     pub fn start_responder(passphrase_canonical: &[u8], sid: &[u8; 16]) -> PakeSide {
         let id = Identity::new(sid);
         let (ctx, msg) =
             Spake2::<Ed25519Group>::start_b(&Password::new(passphrase_canonical), &id, &id);
-        PakeSide { inner: Some(ctx), message: msg }
+        PakeSide {
+            inner: Some(ctx),
+            message: msg,
+        }
     }
 
     pub fn message(&self) -> &[u8] {
@@ -85,40 +88,24 @@ impl PakeSide {
 
     pub fn finish(mut self, peer_message: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let ctx = self.inner.take().expect("finish called once");
-        let out = ctx
-            .finish(peer_message)
-            .map_err(|e| err(ErrorCode::SecPakeFailed, format!("PAKE exchange failed: {e}")))?;
+        let out = ctx.finish(peer_message).map_err(|e| {
+            crate::error::Error::new(
+                ErrorCode::SecPakeFailed,
+                format!("PAKE exchange failed: {e}"),
+            )
+        })?;
         self.message.zeroize();
         Ok(Zeroizing::new(out))
     }
 }
 
-/// Re-derive the SPAKE2 shared secret from the passphrase and both public
-/// PAKE messages. Used by receipt verification and cross-implementation
-/// (WASM) parity tests: given pake1 (side A msg) and pake2 (side B msg) and
-/// the correct passphrase, the result equals the live session secret.
-/// Both `finish` calls yield the same secret because side A computes
-/// x*(Y - N) and side B computes y*(X + M) with matching password elements.
-pub fn shared_secret_from_messages(
-    passphrase_canonical: &[u8],
-    sid: &[u8; 16],
-    pake_msg_a: &[u8],
-    pake_msg_b: &[u8],
-) -> Result<Zeroizing<Vec<u8>>> {
-    if pake_msg_a.len() != PAKE_MSG_LEN || pake_msg_b.len() != PAKE_MSG_LEN {
-        return err(ErrorCode::SecPakeFailed, "PAKE message length invalid");
-    }
-    // Side A: start_a, finish with B's message.
-    let a = PakeSide::start_initiator(passphrase_canonical, sid);
-    let secret_a = a.finish(pake_msg_b)?;
-    // Cross-check via side B: start_b, finish with A's message.
-    let b = PakeSide::start_responder(passphrase_canonical, sid);
-    let secret_b = b.finish(pake_msg_a)?;
-    if !crate::crypto::ct_eq(&secret_a, &secret_b) {
-        return err(ErrorCode::SecPakeFailed, "PAKE messages inconsistent");
-    }
-    Ok(secret_a)
-}
+// NOTE (CDH): the SPAKE2 shared secret CANNOT be re-derived offline from
+// the passphrase and the two public PAKE messages - recovering x*y*G from
+// X = xG+M and Y = yG+N is the Computational Diffie-Hellman problem. This
+// is why receipt verification uses the passphrase-bound MAC (see
+// receipt.rs, deviation D2) instead of re-deriving K_root. The public
+// pake1/pake2 messages stored in exported receipts are transcript
+// evidence, not key material.
 
 /// In-memory, per-sid failed-PAKE counter for the receiver side.
 #[derive(Default)]
@@ -137,7 +124,10 @@ impl AttemptLimiter {
         let n = self.failures.entry(*sid).or_insert(0);
         *n += 1;
         if *n >= PAKE_ATTEMPT_LIMIT {
-            err(ErrorCode::SecAttemptLimit, "too many failed pairing attempts for this session id")
+            err(
+                ErrorCode::SecAttemptLimit,
+                "too many failed pairing attempts for this session id",
+            )
         } else {
             Ok(())
         }

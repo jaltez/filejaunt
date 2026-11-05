@@ -56,9 +56,9 @@ impl ErrorCode {
     /// 5 storage, 1 everything else.
     pub fn exit_code(&self) -> i32 {
         match self {
-            ErrorCode::SecHelloMismatch
-            | ErrorCode::SecPakeFailed
-            | ErrorCode::SecAttemptLimit => 3,
+            ErrorCode::SecHelloMismatch | ErrorCode::SecPakeFailed | ErrorCode::SecAttemptLimit => {
+                3
+            }
             ErrorCode::IceFailed => 4,
             ErrorCode::StorageFailed => 5,
             _ => 1,
@@ -80,7 +80,10 @@ pub enum Error {
 
 impl Error {
     pub fn new(code: ErrorCode, msg: impl Into<String>) -> Error {
-        Error::Code { code, msg: msg.into() }
+        Error::Code {
+            code,
+            msg: msg.into(),
+        }
     }
 
     pub fn code(&self) -> ErrorCode {

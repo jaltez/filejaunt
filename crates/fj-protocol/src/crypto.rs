@@ -37,7 +37,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::error::{err, ErrorCode, Result};
+use crate::error::{ErrorCode, Result};
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 pub type HmacSha256 = Hmac<Sha256>;
@@ -130,7 +130,12 @@ fn lenprefix(out: &mut Vec<u8>, data: &[u8]) {
 
 /// HELO fingerprint: HMAC-SHA256(K_confirm,
 /// lenprefix(offer_sdp) || lenprefix(answer_sdp) || sid).
-pub fn confirm_fp(k_confirm: &Key32, offer_sdp: &str, answer_sdp: &str, sid: &[u8; 16]) -> [u8; 32] {
+pub fn confirm_fp(
+    k_confirm: &Key32,
+    offer_sdp: &str,
+    answer_sdp: &str,
+    sid: &[u8; 16],
+) -> [u8; 32] {
     let mut buf = Vec::with_capacity(offer_sdp.len() + answer_sdp.len() + 48);
     lenprefix(&mut buf, offer_sdp.as_bytes());
     lenprefix(&mut buf, answer_sdp.as_bytes());
@@ -141,12 +146,12 @@ pub fn confirm_fp(k_confirm: &Key32, offer_sdp: &str, answer_sdp: &str, sid: &[u
     out
 }
 
-fn frame_nonce(epoch: u32, dir: Dir, counter: u32) -> Nonce {
+fn frame_nonce(epoch: u32, dir: Dir, counter: u32) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[0..4].copy_from_slice(&epoch.to_le_bytes());
     n[4..8].copy_from_slice(&dir.as_u32().to_le_bytes());
     n[8..12].copy_from_slice(&counter.to_le_bytes());
-    Nonce::from(n)
+    n
 }
 
 /// Encrypt a frame payload. Returns `ciphertext || tag`; the 12-byte header
@@ -161,7 +166,13 @@ pub fn encrypt_frame(
 ) -> Vec<u8> {
     let cipher = Aes256Gcm::new((&**key).into());
     cipher
-        .encrypt(&frame_nonce(epoch, dir, counter), Payload { msg: payload, aad: header })
+        .encrypt(
+            &Nonce::from(frame_nonce(epoch, dir, counter)),
+            Payload {
+                msg: payload,
+                aad: header,
+            },
+        )
         .expect("AES-GCM encryption cannot fail")
 }
 
@@ -177,9 +188,18 @@ pub fn decrypt_frame(
 ) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new((&**key).into());
     cipher
-        .decrypt(&frame_nonce(epoch, dir, counter), Payload { msg: ct, aad: header })
+        .decrypt(
+            &Nonce::from(frame_nonce(epoch, dir, counter)),
+            Payload {
+                msg: ct,
+                aad: header,
+            },
+        )
         .map_err(|_| {
-            err(ErrorCode::ProtoMalformed, "frame authentication failed (tamper or desync)")
+            crate::error::Error::new(
+                ErrorCode::ProtoMalformed,
+                "frame authentication failed (tamper or desync)",
+            )
         })
 }
 
@@ -188,16 +208,34 @@ pub fn decrypt_frame(
 pub fn encrypt_sdp(key: &Key32, label: &str, sdp: &str) -> Vec<u8> {
     let cipher = Aes256Gcm::new((&**key).into());
     cipher
-        .encrypt(&Nonce::from([0u8; 12]), Payload { msg: sdp.as_bytes(), aad: label.as_bytes() })
+        .encrypt(
+            &Nonce::from([0u8; 12]),
+            Payload {
+                msg: sdp.as_bytes(),
+                aad: label.as_bytes(),
+            },
+        )
         .expect("AES-GCM encryption cannot fail")
 }
 
 pub fn decrypt_sdp(key: &Key32, label: &str, ct: &[u8]) -> Result<String> {
     let cipher = Aes256Gcm::new((&**key).into());
     let pt = cipher
-        .decrypt(&Nonce::from([0u8; 12]), Payload { msg: ct, aad: label.as_bytes() })
-        .map_err(|_| err(ErrorCode::SecPakeFailed, "SDP envelope authentication failed"))?;
-    String::from_utf8(pt).map_err(|_| err(ErrorCode::ProtoMalformed, "SDP is not UTF-8"))
+        .decrypt(
+            &Nonce::from([0u8; 12]),
+            Payload {
+                msg: ct,
+                aad: label.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            crate::error::Error::new(
+                ErrorCode::SecPakeFailed,
+                "SDP envelope authentication failed",
+            )
+        })?;
+    String::from_utf8(pt)
+        .map_err(|_| crate::error::Error::new(ErrorCode::ProtoMalformed, "SDP is not UTF-8"))
 }
 
 /// Constant-time equality for MACs / fingerprints.
