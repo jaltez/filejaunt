@@ -58,7 +58,7 @@ crates/fj-webrtc     webrtc-rs glue, STUN client, NAT classifier
 crates/fj-cli        `filejaunt` binary
 crates/fj-wasm       wasm-bindgen facade for the web client
 crates/xtask         dev tasks (`cargo xtask gen-vectors`)
-fuzz/                cargo-fuzz targets (frame_decode, envelope_parse)
+fuzz/                cargo-fuzz targets (frame_decode, envelope_parse; guían local con `cargo fuzz`, ver abajo)
 tests/               multi-process CLI e2e + protocol vectors
 web/                 DOM-free TS engine (library) + minimal reference app
 e2e/                 Playwright browser suite
