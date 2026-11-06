@@ -1,4 +1,4 @@
-Report written to `/home/javier/projects/filejaunt/browser-p2p-report-2026.md`.
+Report written to `~/projects/filejaunt/browser-p2p-report-2026.md`.
 
 # Browser-only P2P file transfer between two PCs (2026)
 
