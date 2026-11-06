@@ -1802,6 +1802,19 @@ impl Session {
         self.epoch
     }
 
+    /// Visual verification checksum (Wormhole-style): first 4 bytes of
+    /// SHA-256(K_confirm) as 8 uppercase hex chars. Both peers derive the
+    /// same value after pairing; comparing them on screen/voice detects an
+    /// active MITM in the signaling channel. Empty before pairing.
+    pub fn verify_checksum(&self) -> Option<String> {
+        use sha2::Digest;
+        let k = self.k_confirm.as_ref()?;
+        let d = sha2::Sha256::digest(**k);
+        let hex = hex::encode(d);
+        let upper = hex[..4].to_uppercase();
+        Some(format!("{} {}", &upper[..2], &upper[2..]))
+    }
+
     /// Whether this session uses private (p3) pairing (restored on resume).
     pub fn private3(&self) -> bool {
         self.private3

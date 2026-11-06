@@ -71,6 +71,11 @@ enum Cmd {
         /// Fan-out to N receivers (1..=4)
         #[arg(long, default_value_t = 1)]
         receivers: u8,
+
+        /// Signaling relay URL (Wormhole-style pairing): both sides use the
+        /// same relay and only exchange the passphrase out-of-band
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Receive files (you are the answer side)
     Receive {
@@ -89,6 +94,10 @@ enum Cmd {
         /// Overwrite existing files without asking
         #[arg(long)]
         yes: bool,
+
+        /// Signaling relay URL (Wormhole-style pairing)
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Resume an interrupted transfer (same passphrase as the original)
     Resume {
@@ -114,6 +123,10 @@ enum Cmd {
         /// Send side: resume as sender
         #[arg(long)]
         send: bool,
+
+        /// Signaling relay URL (Wormhole-style pairing)
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Diagnose NAT behavior via STUN
     Doctor {
@@ -176,6 +189,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
             gzip,
             channels,
             receivers,
+            relay,
         } => {
             if paths.is_empty() {
                 eprintln!("no paths given");
@@ -204,6 +218,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                 channels: channels as usize,
                 yes: true,
                 passphrase_prompt: None,
+                relay_url: relay.clone(),
                 sources: std::cell::RefCell::new(vec![]),
             };
             match engine
@@ -229,6 +244,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
             stun,
             turn,
             yes,
+            relay,
         } => {
             let engine = Engine {
                 out,
@@ -237,6 +253,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                 channels: 1,
                 yes,
                 passphrase_prompt: None,
+                relay_url: relay.clone(),
                 sources: std::cell::RefCell::new(vec![]),
             };
             match engine.receive(&dir, None).await {
@@ -254,6 +271,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
             turn,
             yes,
             send,
+            relay,
         } => {
             if send {
                 // sender resume: no blob to read first, prompt up-front
@@ -270,6 +288,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                     channels: 1,
                     yes: true,
                     passphrase_prompt: Some(passphrase),
+                    relay_url: relay.clone(),
                     sources: std::cell::RefCell::new(vec![]),
                 };
                 // sender resume: no paths needed, manifest comes from state
@@ -298,6 +317,7 @@ async fn run(cli: Cli, out: Out, store: store::Store) -> i32 {
                     channels: 1,
                     yes,
                     passphrase_prompt: None,
+                    relay_url: relay.clone(),
                     sources: std::cell::RefCell::new(vec![]),
                 };
                 match engine.receive(&dir, Some(&sid)).await {

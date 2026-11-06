@@ -357,6 +357,18 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
     let _ = (pid, sig);
 }
 
+/// Path to the freshly built `fj-relay` binary (same profile resolution).
+pub fn relay_bin_path() -> String {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../target");
+    for prof in ["release", "debug"] {
+        let p = format!("{base}/{prof}/fj-relay");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    format!("{base}/release/fj-relay")
+}
+
 pub fn sha256_file(path: &str) -> String {
     use sha2::Digest;
     let mut f = std::fs::File::open(path).unwrap();

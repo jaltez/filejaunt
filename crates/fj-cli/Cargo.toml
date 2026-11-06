@@ -17,6 +17,10 @@ clap = { version = "4", features = ["derive"] }
 # `filejaunt completions <SHELL>` subcommand.
 clap_complete = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "signal", "io-util", "io-std"] }
+# NOTE (dep note, allowed by plan): relay-mode signaling client (Wormhole-style
+# pairing). Server counterpart is crates/fj-relay.
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"

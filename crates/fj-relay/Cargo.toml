@@ -1,0 +1,17 @@
+[package]
+name = "fj-relay"
+version = "0.1.0"
+edition = "2024"
+description = "filejaunt signaling relay: room-based WebSocket relay for pairing blobs. Sees ciphertext and room hashes only."
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "fj-relay"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+futures-util = "0.3"
+serde_json = "1"

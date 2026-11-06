@@ -414,3 +414,109 @@ fn cli_cancel_sigint() {
     assert_eq!(again.sender.exit_code(), 0);
     assert_eq!(again.receiver.exit_code(), 0);
 }
+
+#[test]
+fn cli_relay_pairing() {
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+
+    let out = "/tmp/fj-e2e-relay";
+    fresh_dir(out);
+    let sender_bin = fj_e2e::cli::bin_path();
+    let relay_bin = fj_e2e::cli::relay_bin_path();
+    let relay = Command::new(&relay_bin)
+        .args(["18099"])
+        .spawn()
+        .expect("spawn relay");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let mut sender = Command::new(sender_bin.clone())
+        .args([
+            "send",
+            "../fixtures/random.bin",
+            "--json",
+            "--stun",
+            "none",
+            "--relay",
+            "ws://127.0.0.1:18099/ws",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sender");
+    let mut receiver = Command::new(sender_bin)
+        .args([
+            "receive",
+            "--out",
+            out,
+            "--json",
+            "--yes",
+            "--stun",
+            "none",
+            "--relay",
+            "ws://127.0.0.1:18099/ws",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver");
+
+    let mut hello_line = String::new();
+    {
+        let mut r = std::io::BufReader::new(sender.stdout.take().unwrap());
+        while hello_line.is_empty() || !hello_line.contains("hello") {
+            hello_line.clear();
+            let n = r.read_line(&mut hello_line).unwrap();
+            if n == 0 {
+                panic!("sender stdout closed before hello: is the relay up?");
+            }
+        }
+    }
+    let hello: serde_json::Value = serde_json::from_str(hello_line.trim()).unwrap();
+    let pass = hello["passphrase"].as_str().unwrap().to_string();
+
+    {
+        // relay mode: the receiver derives the room from the passphrase alone
+        let mut w = receiver.stdin.take().unwrap();
+        writeln!(w, "{pass}").unwrap();
+        w.flush().unwrap();
+    }
+
+    let serr = sender.stderr.take().unwrap();
+    let rerr = receiver.stderr.take().unwrap();
+    let serr_t = std::thread::spawn(move || {
+        let mut buf = String::new();
+        for line in std::io::BufRead::lines(std::io::BufReader::new(serr)) {
+            buf.push_str(&line.unwrap_or_default());
+            buf.push('\n');
+        }
+        buf
+    });
+    let rerr_t = std::thread::spawn(move || {
+        let mut buf = String::new();
+        for line in std::io::BufRead::lines(std::io::BufReader::new(rerr)) {
+            buf.push_str(&line.unwrap_or_default());
+            buf.push('\n');
+        }
+        buf
+    });
+
+    let scode = sender.wait().unwrap();
+    let rcode = receiver.wait().unwrap();
+    let _ = serr_t;
+    let rerr_out = rerr_t.join().unwrap_or_default();
+    let sc = scode.code().unwrap_or(-1);
+    let rc = rcode.code().unwrap_or(-1);
+    if sc != 0 || rc != 0 {
+        panic!(
+            "relay transfer failed: sender={sc} receiver={rc}\n--- receiver stderr ---\n{rerr_out}"
+        );
+    }
+    assert_eq!(
+        sha256_file(&format!("{out}/random.bin")),
+        sha256_file("../fixtures/random.bin"),
+        "bytes identical via relay"
+    );
+}

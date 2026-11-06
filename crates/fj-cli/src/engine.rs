@@ -71,12 +71,40 @@ pub struct Engine {
     pub ice: IceConfig,
     pub channels: usize,
     pub yes: bool,
-    pub passphrase_prompt: Option<String>, // resume: passphrase known up-front
+    pub passphrase_prompt: Option<String>,
+    /// relay URL for pairing-blob transport (None = manual paste mode)
+    pub relay_url: Option<String>, // resume: passphrase known up-front
     /// file id -> absolute source path (sender side; used to wrap state)
     pub sources: std::cell::RefCell<Vec<PathBuf>>,
 }
 
 impl Engine {
+    fn log_step(&self, msg: &str) {
+        self.out.stderr_line(msg);
+    }
+
+    /// Wormhole-style visual checksum derived from K_confirm. Show on both
+    /// screens; matching values rule out a signaling-channel MITM.
+    fn show_checksum(&self, session: &Session, relay_mode: bool) {
+        if !relay_mode {
+            return;
+        }
+        let Some(sum) = session.verify_checksum() else {
+            return;
+        };
+        match self.out.mode {
+            Mode::Json => {
+                self.out
+                    .json(serde_json::json!({"type": "checksum", "checksum": sum}));
+            }
+            Mode::Human => {
+                self.out.stderr_line(&format!(
+                    "verification checksum: {sum} — compare on both screens"
+                ));
+            }
+        }
+    }
+
     /// Structured failure: stderr line always; NDJSON `error` event in --json
     /// mode (the documented event contract).
     fn fail_event(&self, code: ErrorCode, msg: &str) -> ErrorCode {
@@ -442,36 +470,55 @@ impl Engine {
                     eprintln!("\x1b[1;33mpassphrase (say it, don't send it):\x1b[0m");
                 }
                 eprintln!("\x1b[1;32m{passphrase}\x1b[0m");
-                eprintln!("blob-1 (paste to the other side):");
-                println!("{blob1}");
-                let _ = std::io::stdout().flush();
+                if self.relay_url.is_none() {
+                    eprintln!("blob-1 (paste to the other side):");
+                    println!("{blob1}");
+                    let _ = std::io::stdout().flush();
+                }
             }
         }
 
         // resume must keep the restored pairing mode/channel count
         let effective_private3 = session.private3();
         let channels = session.channels().max(1);
-        let blob2 = read_blob_field(self.out.mode, "blob2")?;
+
+        // Relay mode: transport blob-1/blob-2 (and blob-3/blob-4 for p3)
+        // through the signaling relay room instead of copy/paste. The
+        // initiator speaks first (blob-1).
+        let relay = if let Some(url) = &self.relay_url {
+            let room = RelayHandle::room_from_passphrase(&passphrase);
+            let rc = RelayHandle::connect(url, &room).await?;
+            // initiator speaks first: blob-1 only after the peer joined
+            rc.wait_peer().await.map_err(|_| ErrorCode::IceFailed)?;
+            rc.send_blob(&blob1)?;
+            Some(rc)
+        } else {
+            None
+        };
+
+        let blob2 = match relay.as_ref() {
+            Some(rc) => rc.recv_blob().await.map_err(|e| {
+                eprintln!("relay recv failed: {e}");
+                ErrorCode::IceFailed
+            })?,
+            None => read_blob_field(self.out.mode, "blob2")?,
+        };
         session.initiator_accept(&blob2).map_err(|e| {
             eprintln!("[{}] pairing failed: {}", e.code(), e.msg());
             ErrorCode::SecPakeFailed
         })?;
+        self.show_checksum(&session, relay.is_some());
         if effective_private3 {
+            let Some(rc) = relay.as_ref() else {
+                eprintln!("p3 resume requires --relay (restored session is private)");
+                return Err(ErrorCode::ProtoMalformed);
+            };
             let blob3 = session.initiator_private_blob3().map_err(|e| {
                 eprintln!("[{}] {}", e.code(), e.msg());
                 ErrorCode::SecPakeFailed
             })?;
-            match self.out.mode {
-                Mode::Json => self
-                    .out
-                    .json(serde_json::json!({"type": "blob3", "blob3": blob3})),
-                Mode::Human => {
-                    eprintln!("blob-3 (paste to the other side):");
-                    println!("{blob3}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            let blob4 = read_blob_field(self.out.mode, "blob4")?;
+            rc.send_blob(&blob3).map_err(|_| ErrorCode::IceFailed)?;
+            let blob4 = rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?;
             session.initiator_private_final(&blob4).map_err(|e| {
                 eprintln!("[{}] {}", e.code(), e.msg());
                 ErrorCode::SecPakeFailed
@@ -792,16 +839,37 @@ impl Engine {
         out_dir: &Path,
         resume_sid: Option<&str>,
     ) -> Result<Outcome, ErrorCode> {
-        // 1) blob-1 (or the hello event) from stdin
-        let blob1 = read_blob_field(self.out.mode, "blob1")?;
-        let passphrase = match &self.passphrase_prompt {
-            Some(p) => p.clone(),
-            None => read_line_prompt("passphrase: "),
+        // 1) pairing transport: relay room (passphrase first — it derives the
+        // room id) or manual paste (blob-1, then passphrase)
+        let (relay, blob1, passphrase) = match (&self.relay_url, self.passphrase_prompt.as_deref())
+        {
+            (Some(url), prompt) => {
+                let pass = match prompt {
+                    Some(p) => p.to_string(),
+                    None => read_line_prompt("passphrase: "),
+                };
+                if pass.is_empty() {
+                    eprintln!("no passphrase given");
+                    return Err(ErrorCode::SecPakeFailed);
+                }
+                let room = RelayHandle::room_from_passphrase(&pass);
+                let rc = RelayHandle::connect(url, &room).await?;
+                let blob1 = rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?;
+                (Some(rc), blob1, pass)
+            }
+            (None, prompt) => {
+                let blob1 = read_blob_field(self.out.mode, "blob1")?;
+                let pass = match prompt {
+                    Some(p) => p.to_string(),
+                    None => read_line_prompt("passphrase: "),
+                };
+                if pass.is_empty() {
+                    eprintln!("no passphrase given");
+                    return Err(ErrorCode::SecPakeFailed);
+                }
+                (None, blob1, pass)
+            }
         };
-        if passphrase.is_empty() {
-            eprintln!("no passphrase given");
-            return Err(ErrorCode::SecPakeFailed);
-        }
 
         let peer = PeerHandle::new(&self.ice)
             .await
@@ -833,8 +901,8 @@ impl Engine {
                                 e.code()
                             },
                         )?;
-                    self.emit_blob2(&blob2);
-                    self.p3_responder(&peer, &mut s, channels, &mut limiter)
+                    self.emit_blob2(relay.as_ref(), &blob2);
+                    self.p3_responder(&peer, &mut s, channels, &mut limiter, relay.as_ref())
                         .await?;
                     s
                 } else {
@@ -849,7 +917,7 @@ impl Engine {
                                 eprintln!("[{}] {}", e.code(), e.msg());
                                 e.code()
                             })?;
-                    self.emit_blob2(&blob2);
+                    self.emit_blob2(relay.as_ref(), &blob2);
                     s
                 }
             }
@@ -870,8 +938,8 @@ impl Engine {
                             eprintln!("[{}] {}", e.code(), e.msg());
                             e.code()
                         })?;
-                    self.emit_blob2(&blob2);
-                    self.p3_responder(&peer, &mut s, channels, &mut limiter)
+                    self.emit_blob2(relay.as_ref(), &blob2);
+                    self.p3_responder(&peer, &mut s, channels, &mut limiter, relay.as_ref())
                         .await?;
                     s
                 } else {
@@ -886,7 +954,7 @@ impl Engine {
                             eprintln!("[{}] {}", e.code(), e.msg());
                             e.code()
                         })?;
-                    self.emit_blob2(&blob2);
+                    self.emit_blob2(relay.as_ref(), &blob2);
                     s
                 }
             }
@@ -900,6 +968,7 @@ impl Engine {
             files: HashMap::new(),
             confirmed: false,
             frames,
+            relay,
         };
         rx.peer
             .wait_channels_open(Duration::from_secs(20))
@@ -986,6 +1055,7 @@ impl Engine {
         session: &mut Session,
         channels: usize,
         limiter: &mut AttemptLimiter,
+        relay: Option<&RelayHandle>,
     ) -> Result<(), ErrorCode> {
         let blob3 = read_blob_field(self.out.mode, "blob3")?;
         let offer = session
@@ -1001,6 +1071,11 @@ impl Engine {
         let blob4 = session
             .responder_private_blob4(&answer)
             .map_err(|e| e.code())?;
+        if let Some(rc) = relay {
+            let _ = rc.send_blob(&blob4);
+            self.log_step("blob-4 sent through relay");
+            return Ok(());
+        }
         match self.out.mode {
             Mode::Json => self
                 .out
@@ -1014,7 +1089,12 @@ impl Engine {
         Ok(())
     }
 
-    fn emit_blob2(&self, blob2: &str) {
+    fn emit_blob2(&self, relay: Option<&RelayHandle>, blob2: &str) {
+        if let Some(rc) = relay {
+            let _ = rc.send_blob(blob2);
+            self.log_step("blob-2 sent through relay");
+            return;
+        }
         match self.out.mode {
             Mode::Json => self
                 .out
@@ -1241,6 +1321,132 @@ impl Engine {
 // plumbing
 // ---------------------------------------------------------------------------
 
+/// Signaling-relay transport for the pairing blobs (Wormhole-style):
+/// both sides derive the same room id from the passphrase and exchange the
+/// opaque blobs through a fj-relay server. The relay sees the room id
+/// (a hash of the passphrase) and ciphertext only.
+pub struct RelayHandle {
+    inbound: std_mpsc::Receiver<RelayEvent>,
+    outbound: std_mpsc::Sender<String>,
+}
+
+#[derive(Debug)]
+pub enum RelayEvent {
+    PeerJoined,
+    Blob(String),
+    Gone,
+}
+
+impl RelayHandle {
+    /// Room id derived from the typed passphrase (SHA-256, first 16 hex).
+    /// Both sides derive the same id; the relay cannot invert it.
+    pub fn room_from_passphrase(passphrase: &str) -> String {
+        use sha2::Digest;
+        let canon = fj_protocol::pake::canonical_passphrase(passphrase);
+        hex::encode(sha2::Sha256::digest(canon.as_bytes()))[..16].to_string()
+    }
+
+    /// Connect to the relay and join the room derived from the passphrase.
+    pub async fn connect(url: &str, room: &str) -> Result<RelayHandle, ErrorCode> {
+        use futures_util::{SinkExt, StreamExt};
+        let (ws, _) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
+            eprintln!("relay connect failed: {e}");
+            ErrorCode::IceFailed
+        })?;
+        let (mut sink, mut stream) = ws.split();
+        sink.send(tungstenite_text(&format!(
+            "{{\"t\":\"join\",\"room\":\"{room}\"}}"
+        )))
+        .await
+        .map_err(|_| ErrorCode::IceFailed)?;
+        let (blob_tx, blob_rx) = std_mpsc::channel::<RelayEvent>();
+        let (out_tx, out_rx) = std_mpsc::channel::<String>();
+        // drive the websocket with two forwarders: inbound → blob_rx,
+        // outbound ← out_rx (std channels; no select needed)
+        let in_tx = blob_tx.clone();
+        let _out_tx2 = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(m)) = stream.next().await {
+                let tokio_tungstenite::tungstenite::Message::Text(line) = m else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                match v.get("t").and_then(|t| t.as_str()) {
+                    Some("msg") => {
+                        if let Some(d) = v.get("data").and_then(|d| d.as_str()) {
+                            let _ = in_tx.send(RelayEvent::Blob(d.to_string()));
+                        }
+                    }
+                    Some("peer-joined") => {
+                        let _ = in_tx.send(RelayEvent::PeerJoined);
+                    }
+                    Some("peer-left") | Some("error") => {
+                        let _ = in_tx.send(RelayEvent::Gone);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok(line) = out_rx.recv() {
+                if sink
+                    .send(tokio_tungstenite::tungstenite::Message::Text(line))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(RelayHandle {
+            inbound: blob_rx,
+            outbound: out_tx,
+        })
+    }
+
+    /// Wait until the peer joined (sender must wait before sending blob-1).
+    pub async fn wait_peer(&self) -> Result<(), ErrorCode> {
+        loop {
+            match self.inbound.recv_timeout(Duration::from_secs(120)) {
+                Ok(RelayEvent::PeerJoined) => return Ok(()),
+                Ok(_) => continue,
+                Err(_) => return Err(ErrorCode::IceFailed),
+            }
+        }
+    }
+
+    pub fn send_blob(&self, blob: &str) -> Result<(), ErrorCode> {
+        let line = serde_json::json!({ "t": "msg", "data": blob }).to_string();
+        self.outbound
+            .send(line)
+            .map_err(|_| ErrorCode::IceFailed)
+    }
+
+    /// Receive the next blob (timeout: dead relay / peer never sent).
+    pub async fn recv_blob(&self) -> Result<String, ErrorCode> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err(ErrorCode::IceFailed);
+            }
+            match self.inbound.recv_timeout(Duration::from_millis(200)) {
+                Ok(RelayEvent::Blob(b)) => return Ok(b),
+                Ok(_) => continue,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ErrorCode::IceFailed);
+                }
+            }
+        }
+    }
+}
+
+fn tungstenite_text(line: &str) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(line.to_string())
+}
+
 fn rel_path(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
@@ -1267,6 +1473,10 @@ struct Receiver {
     files: HashMap<u16, (PathBuf, Option<std::fs::File>)>,
     confirmed: bool,
     frames: std_mpsc::Receiver<Vec<u8>>,
+    /// signaling relay (relay mode); kept alive through the transfer loop —
+    /// read only for the p3 blob-4 emission during pairing
+    #[allow(dead_code)]
+    relay: Option<RelayHandle>,
 }
 
 /// Read one stdin line: in JSON mode the line is an NDJSON event and the
