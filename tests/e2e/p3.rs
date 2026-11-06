@@ -508,12 +508,16 @@ fn relay_transfer(private3: bool) {
         }
     }
     let hello: serde_json::Value = serde_json::from_str(hello_line.trim()).unwrap();
-    let pass = hello["passphrase"].as_str().unwrap().to_string();
+    let code = hello["code"].as_str().unwrap().to_string();
+    assert!(
+        code.starts_with("fj-"),
+        "combined pairing code emitted: {code}"
+    );
 
     {
-        // relay mode: the receiver derives the room from the passphrase alone
+        // relay mode: the receiver only needs this single code
         let mut w = receiver.stdin.take().unwrap();
-        writeln!(w, "{pass}").unwrap();
+        writeln!(w, "{code}").unwrap();
         w.flush().unwrap();
     }
 

@@ -458,19 +458,40 @@ impl Engine {
             }
         };
         let sid = session.sid_hex();
+        // Relay mode: one-line pairing code (Wormhole style) — the room id
+        // travels in the code, so the receiver types a single string.
+        let relay_room = self
+            .relay_url
+            .as_ref()
+            .map(|_| RelayHandle::room_from_passphrase(&passphrase));
+        let code = relay_room
+            .as_ref()
+            .map(|room| pairing_code(room, &passphrase));
 
         match self.out.mode {
             Mode::Json => self.out.json(serde_json::json!({
                 "type": "hello", "sid": sid, "passphrase": passphrase, "blob1": blob1,
                 "private3": private3,
+                "code": code,
             })),
             Mode::Human => {
-                if resume.is_some() {
-                    eprintln!("\x1b[1;33mresume passphrase (same as the original session):\x1b[0m");
+                if let Some(code) = &code {
+                    if resume.is_some() {
+                        eprintln!("\x1b[1;33mresume code (same passphrase session):\x1b[0m");
+                    } else {
+                        eprintln!("\x1b[1;33mpairing code (say or send it):\x1b[0m");
+                    }
+                    eprintln!("\x1b[1;32m{code}\x1b[0m");
                 } else {
-                    eprintln!("\x1b[1;33mpassphrase (say it, don't send it):\x1b[0m");
+                    if resume.is_some() {
+                        eprintln!(
+                            "\x1b[1;33mresume passphrase (same as the original session):\x1b[0m"
+                        );
+                    } else {
+                        eprintln!("\x1b[1;33mpassphrase (say it, don't send it):\x1b[0m");
+                    }
+                    eprintln!("\x1b[1;32m{passphrase}\x1b[0m");
                 }
-                eprintln!("\x1b[1;32m{passphrase}\x1b[0m");
                 if self.relay_url.is_none() {
                     eprintln!("blob-1 (paste to the other side):");
                     println!("{blob1}");
@@ -486,9 +507,8 @@ impl Engine {
         // Relay mode: transport blob-1/blob-2 (and blob-3/blob-4 for p3)
         // through the signaling relay room instead of copy/paste. The
         // initiator speaks first (blob-1).
-        let relay = if let Some(url) = &self.relay_url {
-            let room = RelayHandle::room_from_passphrase(&passphrase);
-            let rc = RelayHandle::connect(url, &room).await?;
+        let relay = if let (Some(url), Some(room)) = (&self.relay_url, &relay_room) {
+            let rc = RelayHandle::connect(url, room).await?;
             // initiator speaks first: blob-1 only after the peer joined
             rc.wait_peer().await.map_err(|_| ErrorCode::IceFailed)?;
             rc.send_blob(&blob1)?;
@@ -858,15 +878,23 @@ impl Engine {
         let (relay, blob1, passphrase) = match (&self.relay_url, self.passphrase_prompt.as_deref())
         {
             (Some(url), prompt) => {
-                let pass = match prompt {
+                let input = match prompt {
                     Some(p) => p.to_string(),
-                    None => read_line_prompt("passphrase: "),
+                    None => read_line_prompt("pairing code (or passphrase): "),
                 };
-                if pass.is_empty() {
-                    eprintln!("no passphrase given");
+                if input.trim().is_empty() {
+                    eprintln!("no pairing code given");
                     return Err(ErrorCode::SecPakeFailed);
                 }
-                let room = RelayHandle::room_from_passphrase(&pass);
+                // `fj-<room8>-<words>` carries the room id; a bare input
+                // falls back to deriving the room from the passphrase.
+                let (room, pass) = match parse_pairing_code(&input) {
+                    Some((r, p)) => (r, p),
+                    None => (
+                        RelayHandle::room_from_passphrase(&input),
+                        input.trim().to_string(),
+                    ),
+                };
                 let rc = RelayHandle::connect(url, &room).await?;
                 let blob1 = rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?;
                 (Some(rc), blob1, pass)
@@ -1349,6 +1377,25 @@ pub struct RelayHandle {
     outbound: std_mpsc::Sender<String>,
 }
 
+/// One-line pairing code (Wormhole style): `fj-<room8>-<passphrase>`.
+/// The receiver joins the room and runs PAKE with the passphrase —
+/// typing this single string is enough to connect.
+pub fn pairing_code(room: &str, passphrase: &str) -> String {
+    format!("fj-{room}-{passphrase}")
+}
+
+/// Split a pasted pairing code into (room, passphrase). Returns None
+/// when the input has no `<8 hex>-` prefix (bare passphrase input).
+pub fn parse_pairing_code(input: &str) -> Option<(String, String)> {
+    let t = input.trim().strip_prefix("fj-").unwrap_or(input.trim());
+    let (room, rest) = t.split_once('-')?;
+    if room.len() == 8 && room.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((room.to_ascii_lowercase(), rest.trim().to_string()))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub enum RelayEvent {
     PeerJoined,
@@ -1357,12 +1404,16 @@ pub enum RelayEvent {
 }
 
 impl RelayHandle {
-    /// Room id derived from the typed passphrase (SHA-256, first 16 hex).
-    /// Both sides derive the same id; the relay cannot invert it.
+    /// Room id derived from the typed passphrase (SHA-256, first 8 hex —
+    /// 4.3e9 ids make collisions among a relay's live rooms negligible).
+    /// Deterministic so both sides (and resumes) meet in the same room;
+    /// the relay cannot invert it. With a generated 77-bit passphrase this
+    /// leaks nothing usable; see SECURITY.md before allowing user-chosen
+    /// passphrases over the relay.
     pub fn room_from_passphrase(passphrase: &str) -> String {
         use sha2::Digest;
         let canon = fj_protocol::pake::canonical_passphrase(passphrase);
-        hex::encode(sha2::Sha256::digest(canon.as_bytes()))[..16].to_string()
+        hex::encode(sha2::Sha256::digest(canon.as_bytes()))[..8].to_string()
     }
 
     /// Connect to the relay and join the room derived from the passphrase.
@@ -1555,3 +1606,36 @@ impl TakeReader {
 // keep tokio_mpsc in scope for future text-chat wiring
 #[allow(unused_imports)]
 use tokio_mpsc as _tokio_mpsc;
+
+#[cfg(test)]
+mod code_tests {
+    use super::{RelayHandle, pairing_code, parse_pairing_code};
+
+    #[test]
+    fn code_roundtrip() {
+        let room = RelayHandle::room_from_passphrase("word-one-word-two");
+        let code = pairing_code(&room, "word-one-word-two");
+        assert!(code.starts_with("fj-"));
+        let (r, p) = parse_pairing_code(&code).expect("parses");
+        assert_eq!(r, room);
+        assert_eq!(p, "word-one-word-two");
+    }
+
+    #[test]
+    fn code_parses_without_prefix_and_case_insensitive_room() {
+        let (r, p) = parse_pairing_code("AB12CD34-word-one-word-two").unwrap();
+        assert_eq!(r, "ab12cd34");
+        assert_eq!(p, "word-one-word-two");
+        assert_eq!(
+            parse_pairing_code("fj-ab12cd34-x"),
+            Some(("ab12cd34".into(), "x".into()))
+        );
+    }
+
+    #[test]
+    fn bare_passphrase_is_not_a_code() {
+        // first word segment is not 8 hex -> None (fallback path)
+        assert!(parse_pairing_code("word-one-word-two-word-three").is_none());
+        assert!(parse_pairing_code("").is_none());
+    }
+}

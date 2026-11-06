@@ -30,10 +30,23 @@ filejaunt send FILE...          # prints passphrase + blob-1, waits for blob-2
 filejaunt receive --out DIR     # paste blob-1, type the passphrase, paste blob-2 back
 filejaunt doctor --stun public  # NAT diagnosis
 filejaunt verify --receipt FILE # receipt check (exit 0 VALID / 3 INVALID)
+
+# CLI with a signaling relay (Wormhole-style, zero pastes)
+cargo install --path crates/fj-relay
+fj-relay 9000                   # run once anywhere; put TLS in front for WAN
+# machine A
+filejaunt send FILE --relay wss://your-host/ws   # prints: fj-9f3a2b41-word-one-...
+# machine B
+filejaunt receive --out DIR --relay wss://your-host/ws
+pairing code (or passphrase): fj-9f3a2b41-word-one-...   # paste the one line, done
 ```
 
-Pairing = passphrase (voice/second channel) + two paste blobs. No server
-involved; LAN sessions use host candidates only (`--stun none`, the default).
+Default pairing = passphrase (voice/second channel) + two paste blobs; no
+server involved and LAN sessions use host candidates only (`--stun none`).
+With a relay, pairing collapses to a single one-line code: the room id rides
+in the code and the blobs travel through the relay encrypted — the relay
+sees only the room id and ciphertext. Both sides also print an 8-hex
+checksum to compare, which detects a MITM in the signaling path.
 
 ## Feature status
 
@@ -55,6 +68,7 @@ involved; LAN sessions use host candidates only (`--stun none`, the default).
 crates/fj-protocol   pure sans-IO core: framing, crypto, PAKE, state machine
 crates/fj-webrtc     webrtc-rs glue, STUN client, NAT classifier
 crates/fj-cli        `filejaunt` binary
+crates/fj-relay      optional signaling relay (rooms, opaque blobs only)
 crates/fj-wasm       wasm-bindgen facade for the web client
 crates/xtask         dev tasks (`cargo xtask gen-vectors`)
 fuzz/                cargo-fuzz targets (frame_decode, envelope_parse; guided fuzzing runs locally, see Testing)
