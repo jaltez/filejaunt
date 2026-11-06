@@ -75,3 +75,13 @@ Documented deviations from the seed design are listed in
 AGPL-3.0-only — uso, estudio, modificación y redistribución libres. Cualquier
 servicio de red derivado debe publicar su código fuente modificado (sección
 13 de la licencia). Ver [`LICENSE`](LICENSE).
+
+## Roadmap (próximos pasos)
+
+- [ ] Emparejamiento QR (passphrase por QR + blob por enlace/canal aparte)
+- [ ] Fan-out multi-receptor en la UI web (slots compartiendo lectura)
+- [ ] TURN opt-in con UI de estado permanente (relay ámbar)
+- [ ] Ventana de negociación de chunk 65519 cuando el par anuncia SCTP grande
+- [ ] Worker para OPFS + hash en la web (sin jank en transfers grandes)
+- [ ] Internacionalización (ES/EN) de los strings de producto
+- [ ] Publicación en crates.io (`filejaunt` bin) y firmas de release (minisign)
