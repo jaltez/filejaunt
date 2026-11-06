@@ -29,19 +29,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      # -s none compiles for the host target with plain g++ (no musl target
-      # installed on purpose: libfuzzer-sys would otherwise need musl-g++).
-      - run: cargo fuzz run frame_decode -s none -- -max_total_time=60
+      # nightly + ASAN on the host GNU target; RUSTUP_TOOLCHAIN overrides the
+      # repo's rust-toolchain.toml (stable) which cannot build -Zsanitizer.
+      - name: fuzz frame_decode
+        run: cargo fuzz run frame_decode -- -max_total_time=60
         working-directory: fuzz
-      - run: cargo fuzz run envelope_parse -s none -- -max_total_time=60
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+      - name: fuzz envelope_parse
+        run: cargo fuzz run envelope_parse -- -max_total_time=60
         working-directory: fuzz
+        env:
+          RUSTUP_TOOLCHAIN: nightly
 
   wasm:
     runs-on: ubuntu-latest
