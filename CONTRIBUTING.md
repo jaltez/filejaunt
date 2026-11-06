@@ -1,14 +1,14 @@
-# Contribuir a filejaunt
+# Contributing to filejaunt
 
-1. `git clone` + `scripts/gen-fixtures.sh` (genera fixtures de test; los
-   commitados ya están en el repo salvo `fixtures/big.bin`).
-2. `cargo test --workspace` debe pasar en verde antes de cualquier PR;
-   `cargo clippy --workspace --all-targets -- -D warnings` y
-   `cargo fmt --check` también.
-3. Los cambios en `crates/fj-protocol` requieren regenerar vectores
-   (`cargo xtask gen-vectors`) y mantener paridad WASM
+1. `git clone` + `scripts/gen-fixtures.sh` (generates test fixtures; the
+   committed ones are already in the repo except `fixtures/big.bin`).
+2. `cargo test --workspace` must be green before any PR;
+   `cargo clippy --workspace --all-targets -- -D warnings` and
+   `cargo fmt --check` too.
+3. Changes to `crates/fj-protocol` require regenerating vectors
+   (`cargo xtask gen-vectors`) and keeping WASM parity
    (`wasm-pack test --node crates/fj-wasm`).
-4. Seguridad: nada de cripto casera; cualquier cambio en derivación de claves
-   o framing requiere actualizar `docs/SECURITY.md` y los vectores.
-5. Licencia: al contribuir aceptas que tu código se distribuya bajo
+4. Security: no home-made crypto; any change to key derivation or framing
+   requires updating `docs/SECURITY.md` and the vectors.
+5. License: by contributing you agree your code is distributed under
    AGPL-3.0-only.

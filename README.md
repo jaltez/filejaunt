@@ -7,13 +7,12 @@ browser↔CLI. No signaling server, no data relay, resumable, ephemeral by
 construction. Rust core (SPAKE2 + AES-256-GCM), WASM web client, CLI.
 Licensed AGPL-3.0-only.
 
----
 Encrypted P2P file transfer: browser↔browser and browser↔CLI, no signaling
-server, no data relay, resumable, ephemeral by construction.
-
-Este README describe el repositorio del core. La especificación de producto
-completa está en [`docs/SEED.md`](docs/SEED.md); el modelo de seguridad en
-[`docs/SECURITY.md`](docs/SECURITY.md).
+server, no data relay, resumable, ephemeral by construction. This README
+covers the core repository; the product spec lives in
+[`docs/SEED.md`](docs/SEED.md) and the security model in
+[`docs/SECURITY.md`](docs/SECURITY.md). The WASM engine library is
+documented in [`docs/LIBRARY.md`](docs/LIBRARY.md).
 
 ## Quickstart
 
@@ -58,7 +57,7 @@ crates/fj-webrtc     webrtc-rs glue, STUN client, NAT classifier
 crates/fj-cli        `filejaunt` binary
 crates/fj-wasm       wasm-bindgen facade for the web client
 crates/xtask         dev tasks (`cargo xtask gen-vectors`)
-fuzz/                cargo-fuzz targets (frame_decode, envelope_parse; guían local con `cargo fuzz`, ver abajo)
+fuzz/                cargo-fuzz targets (frame_decode, envelope_parse; guided fuzzing runs locally, see Testing)
 tests/               multi-process CLI e2e + protocol vectors
 web/                 DOM-free TS engine (library) + minimal reference app
 e2e/                 Playwright browser suite
@@ -71,7 +70,13 @@ scripts/gen-fixtures.sh
 cargo fmt --check && cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo test --workspace --release -- --ignored   # CLI e2e (loopback)
-cargo fuzz run frame_decode  -s none -- -max_total_time=60   # in fuzz/
+
+# guided fuzzing (coverage-guided, nightly + musl):
+rustup toolchain install nightly --profile minimal
+rustup target add x86_64-unknown-linux-musl --toolchain nightly
+sudo apt-get install -y musl-tools
+cd fuzz && cargo fuzz run frame_decode -s none -- -max_total_time=60
+
 wasm-pack test --node crates/fj-wasm
 cd web && node build.mjs && cd ../e2e && npx playwright test
 ```
@@ -79,18 +84,18 @@ cd web && node build.mjs && cd ../e2e && npx playwright test
 Documented deviations from the seed design are listed in
 [`docs/SECURITY.md`](docs/SECURITY.md#deviations).
 
-## Licencia
+## License
 
-AGPL-3.0-only — uso, estudio, modificación y redistribución libres. Cualquier
-servicio de red derivado debe publicar su código fuente modificado (sección
-13 de la licencia). Ver [`LICENSE`](LICENSE).
+AGPL-3.0-only — free to use, study, modify and redistribute. Any network
+service derived from it must publish its modified source code (section 13 of
+the license). See [`LICENSE`](LICENSE).
 
-## Roadmap (próximos pasos)
+## Roadmap
 
-- [ ] Emparejamiento QR (passphrase por QR + blob por enlace/canal aparte)
-- [ ] Fan-out multi-receptor en la UI web (slots compartiendo lectura)
-- [ ] TURN opt-in con UI de estado permanente (relay ámbar)
-- [ ] Ventana de negociación de chunk 65519 cuando el par anuncia SCTP grande
-- [ ] Worker para OPFS + hash en la web (sin jank en transfers grandes)
-- [ ] Internacionalización (ES/EN) de los strings de producto
-- [ ] Publicación en crates.io (`filejaunt` bin) y firmas de release (minisign)
+- [ ] QR pairing (passphrase via QR + blob via link/separate channel)
+- [ ] Multi-receiver fan-out in the web UI (slots sharing reads)
+- [ ] Opt-in TURN with a persistent status UI (amber relay)
+- [ ] 65519 chunk-size negotiation window when the peer announces large SCTP
+- [ ] Web worker for OPFS + hashing (no jank on large transfers)
+- [ ] i18n (ES/EN) for product strings
+- [ ] Publish to crates.io (`filejaunt` bin) and release signatures (minisign)

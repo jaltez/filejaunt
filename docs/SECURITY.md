@@ -1,92 +1,92 @@
-# filejaunt — modelo de seguridad
+# filejaunt — security model
 
-Basado en §4 de `SEED.md`. Garantías y no-garantías, sin marketing.
+Based on §4 of `SEED.md`. Guarantees and non-guarantees, no marketing.
 
-## Garantías
+## Guarantees
 
-| Amenaza | Protección |
+| Threat | Protection |
 |:--|:--|
-| Observador de red (ISP, wifi) | DTLS obligatorio en el DataChannel + capa propia AES-256-GCM por frame (claves PAKE) |
-| Canal que transporta el blob (chat, proxy) | SPAKE2: reescribir el blob sin la passphrase no permite derivar claves; la sustitución de SDP se detecta por el fingerprint de HELO (HMAC-SHA256 sobre offer+answer+sid con K_confirm) |
-| Atacante que retransmite blobs | Solo ve ciphertext; no conoce K_root (CDH) |
-| Servidor web que sirve la app | Artefacto único autocontenido con sha256 publicado (`dist/filejaunt.html.sha256`); sin CDN, sin canal de actualizaciones |
-| Relay TURN (opt-in) | Segunda capa AES-GCM por chunk; el relay ve DTLS pero la app no depende de esa negociación |
-| El otro extremo | Recibo por fichero: SHA-256 + HMAC (K_receipt en vivo, K_pf offline) verificable con la passphrase |
+| Network observer (ISP, Wi-Fi) | Mandatory DTLS on the DataChannel + a per-frame AES-256-GCM layer of our own (PAKE-derived keys) |
+| The channel carrying the blob (chat, proxy) | SPAKE2: rewriting the blob without the passphrase yields no usable keys; SDP substitution is detected by the HELO fingerprint (HMAC-SHA256 over offer+answer+sid with K_confirm) |
+| Attacker retransmitting blobs | Sees ciphertext only; does not know K_root (CDH) |
+| Web server hosting the app | Single self-contained artifact with a published sha256 (`dist/filejaunt.html.sha256`); no CDN, no update channel |
+| TURN relay (opt-in) | Second AES-GCM layer per chunk; the relay sees DTLS but the app does not depend on that negotiation |
+| The other endpoint | Per-file receipt: SHA-256 + HMAC (K_receipt live, K_pf offline) verifiable with the passphrase |
 
-Cripto usada (nada casero): SPAKE2 (grupo Ed25519, crate `spake2`),
-HKDF-SHA256, HMAC-SHA256, AES-256-GCM, comparaciones constant-time
-(`subtle`), zeroize de claves/passphrases.
+Crypto in use (nothing home-made): SPAKE2 (Ed25519 group, `spake2` crate),
+HKDF-SHA256, HMAC-SHA256, AES-256-GCM, constant-time comparisons
+(`subtle`), zeroization of keys/passphrases.
 
-## No garantizado
+## Not guaranteed
 
-- **Anonimato**: el par directo ve tu IP y el patrón de tráfico/tamaños.
-- **Integridad del extremo**: malware en cualquiera de las máquinas.
-- **Disponibilidad**: NAT simétrico / UDP bloqueado → sin TURN no hay
-  conexión; `filejaunt doctor` lo diagnostica.
-- **Offline receipt forgery**: quien conozca la passphrase puede forjar el
-  `macpf` del recibo exportado (ver D2); el MAC de sesión (`K_receipt`)
-  solo lo generan/verifican los participantes en vivo.
-- **Atacante pasivo túnel**: quien retransmite bytes íntegros de ambos blobs
-  puede actuar de túnel ciego (solo ve ciphertext); aceptado y documentado.
+- **Anonymity**: the direct peer sees your IP and traffic/size patterns.
+- **Endpoint integrity**: malware on either machine.
+- **Availability**: symmetric NAT / blocked UDP → no connection without
+  TURN; `filejaunt doctor` diagnoses it.
+- **Offline receipt forgery**: whoever knows the passphrase can forge the
+  exported receipt's `macpf` (see D2); the session MAC (`K_receipt`) is only
+  generated/verified by live participants.
+- **Passive tunnelling attacker**: whoever retransmits both blobs verbatim
+  can act as a blind tunnel (sees ciphertext only); accepted and documented.
 
-## Límites operativos
+## Operational limits
 
-- PAKE online: 3 intentos fallidos por sid en memoria del receptor
-  (`SEC_ATTEMPT_LIMIT`). En el CLI el límite es por proceso (cada ejecución
-  es un intento); en la web el limitador vive en la instancia `FjCore` de la
-  pestaña. Un fallo de HELO/SDP se contabiliza igual que un fallo PAKE.
-- Manifests estrictamente validados (nombres/rutas sin traversal,
-  `PATH_REJECTED` + abort). El glue nunca escribe fuera del outdir.
-- Los snapshots de sesión NO contienen material clave; las claves se
-  re-derivan de la passphrase en cada reconexión (epoch+1 ⇒ nonces nuevos).
-- CSP restrictiva en la app web; cero fetch/XHR; single file con hash.
+- PAKE online: 3 failed attempts per sid in receiver memory
+  (`SEC_ATTEMPT_LIMIT`). In the CLI the limit is per process (each run is
+  one attempt); in the web the limiter lives in the tab's `FjCore`
+  instance. A HELO/SDP failure counts the same as a PAKE failure.
+- Manifests strictly validated (traversal-proof names/paths,
+  `PATH_REJECTED` + abort). The glue never writes outside the outdir.
+- Session snapshots contain NO key material; keys are re-derived from the
+  passphrase on every reconnect (epoch+1 ⇒ fresh nonces).
+- Restrictive CSP in the web app; zero fetch/XHR; hashed single file.
 
-## Política de reporte
+## Reporting policy
 
-Reporta vulnerabilidades abriendo un issue privado / security advisory en
-este repositorio. No hay bounty; respuesta de cortesía en <7 días.
+Report vulnerabilities via a private issue / security advisory on this
+repository. No bounty; courtesy response within 7 days.
 
-## Notas de plataforma
+## Platform notes
 
-- Streaming: los SourceBuffer de MSE necesitan mp4 fragmentado (`moov` +
-  `moof`); el fixture commitado es fMP4 y el e2e lo usa tal cual.
-- En WSL2, Chromium ↔ webrtc-rs necesita
-  `--disable-features=WebRTCHideLocalIpsWithMdns` (solo Playwright; los
-  candidatos mDNS no resuelven contra webrtc-rs).
-- El reproductor puede rechazar un fichero; la transferencia nunca falla por
-  el player.
-- Los vectores de `tests/vectors/protocol.json` usan passphrase/sid/secreto
-  SPAKE2 FIJOS, solo para tests (documentado en el propio JSON): no sirven
-  para atacar sesiones reales (sid real es OsRng, claves efímeras).
-- Versión web v1: un receptor por pestaña (el fan-out multi-receptor es solo
-  CLI); el resume exige el mismo backend de almacenamiento (OPFS) y misma
-  pestaña/perfil — el snapshot no se reanuda contra un directorio FSA elegido
-  a mano.
+- Streaming: MSE SourceBuffers require fragmented mp4 (`moov` + `moof`);
+  the committed fixture is fMP4 and the e2e uses it as-is.
+- On WSL2, Chromium ↔ webrtc-rs needs
+  `--disable-features=WebRTCHideLocalIpsWithMdns` (Playwright only; mDNS
+  candidates do not resolve against webrtc-rs).
+- The player may reject a file; the transfer itself never fails because of
+  the player.
+- The vectors in `tests/vectors/protocol.json` use a FIXED passphrase, sid
+  and SPAKE2 secret, test-only (documented in the JSON itself): useless for
+  attacking real sessions (a real sid is OsRng, keys are ephemeral).
+- Web v1: one receiver per tab (multi-receiver fan-out is CLI-only); resume
+  requires the same storage backend (OPFS) and same tab/profile — a
+  snapshot does not resume against a manually picked FSA directory.
 
-## Checklist de build reproducible
+## Reproducible build checklist
 
 ```sh
 git checkout <tag> && cargo build --release --locked -p fj-cli
-scripts/publish-app.sh          # imprime sha256 del HTML
+scripts/publish-app.sh          # prints the HTML sha256
 (cd web/dist && sha256sum -c filejaunt.html.sha256)
 ```
 
-El CI corre fmt + clippy(-D warnings) + tests + fuzz(60s) + wasm parity +
-supply-chain (cargo-deny advisories+licenses).
+CI runs fmt + clippy(-D warnings) + tests + fuzz-smoke + wasm parity +
+supply-chain (cargo-deny advisories+licenses). Guided cargo-fuzz runs are
+documented in the README Testing section.
 
-## Desviaciones documentadas respecto a SEED/plan
+## Documented deviations from SEED/plan
 
-- **D1** — K_env con nonce cero para offer y answer reutilizaba
-  key+nonce en modo privado (rotura GCM). Se derivan subclaves
-  `K_env_offer`/`K_env_answer` de K_env; formato de wire y UX intactos.
-- **D2** — La re-derivación offline de K_root desde los mensajes PAKE
-  públicos es imposible (CDH); el recibo exportado añade `macpf`
-  (HMAC bajo HKDF(passphrase, sid)) verificable con la passphrase. `mac`
-  (K_receipt) se verifica en vivo durante la sesión.
-- **D3** — `Action::Send` transporta bytes ya cifrados (el contador de
-  cifrado avanza en el orden de emisión) en vez de frames en claro.
-- **D4** — El campo `seq` de cabecera lleva SIEMPRE el contador de cifrado
-  (chunk_index viaja en el payload de CHUNK). Necesario para que el
-  descifrado no dependa del orden de llegada entre 4 canales.
-- **D5** — El envelope-1 añade el campo `ch` (número de canales): el SDP no
-  permite deducirlo (un solo `m=application`).
+- **D1** — K_env with a zero nonce for both offer and answer reused
+  key+nonce in private mode (GCM break). Subkeys `K_env_offer`/`K_env_answer`
+  are derived from K_env; wire format and UX unchanged.
+- **D2** — Offline re-derivation of K_root from the public PAKE messages is
+  impossible (CDH); the exported receipt adds `macpf` (HMAC under
+  HKDF(passphrase, sid)) verifiable with the passphrase. `mac` (K_receipt)
+  is verified live during the session.
+- **D3** — `Action::Send` carries already-encrypted bytes (the encryption
+  counter advances in emission order) instead of plaintext frames.
+- **D4** — The header `seq` field ALWAYS carries the encryption counter
+  (chunk_index travels in the CHUNK payload). Required so decryption does
+  not depend on arrival order across 4 channels.
+- **D5** — Envelope-1 adds the `ch` field (channel count): the SDP cannot
+  reveal it (a single `m=application`).
