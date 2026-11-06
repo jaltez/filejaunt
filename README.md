@@ -1,5 +1,13 @@
 # filejaunt — core
 
+[![CI](https://github.com/jaltez/filejaunt/actions/workflows/ci.yml/badge.svg)](https://github.com/jaltez/filejaunt/actions/workflows/ci.yml)
+
+**filejaunt** — encrypted peer-to-peer file transfer: browser↔browser and
+browser↔CLI. No signaling server, no data relay, resumable, ephemeral by
+construction. Rust core (SPAKE2 + AES-256-GCM), WASM web client, CLI.
+Licensed AGPL-3.0-only.
+
+---
 Encrypted P2P file transfer: browser↔browser and browser↔CLI, no signaling
 server, no data relay, resumable, ephemeral by construction.
 
