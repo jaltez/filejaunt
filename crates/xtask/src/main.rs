@@ -227,6 +227,7 @@ fn gen_vectors() {
 
     let vectors = json!({
         "v": 1,
+        "_note": "TEST VECTORS ONLY: passphrase, sid and the SPAKE2 shared secret are fixed test values pinned to these recorded frames. They unlock nothing outside this file - real sessions derive fresh keys from fresh SPAKE2 runs.",
         "passphrase": PASSPHRASE,
         "passphrase_canonical": canon,
         "sid_hex": hex::encode(SID),
