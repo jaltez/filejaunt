@@ -30,15 +30,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      # -s none builds a musl static binary (mirrors local verification).
+      # -s none compiles for the host target with plain g++ (no musl target
+      # installed on purpose: libfuzzer-sys would otherwise need musl-g++).
       - run: cargo fuzz run frame_decode -s none -- -max_total_time=60
         working-directory: fuzz
       - run: cargo fuzz run envelope_parse -s none -- -max_total_time=60
