@@ -417,29 +417,62 @@ fn cli_cancel_sigint() {
 
 #[test]
 fn cli_relay_pairing() {
+    relay_transfer(false);
+}
+
+#[test]
+fn cli_relay_private_pairing() {
+    // p3 (all SDP encrypted) over the signaling relay: blob-3/blob-4 must
+    // flow through the relay room on BOTH sides, not stdin/stdout.
+    relay_transfer(true);
+}
+
+fn relay_transfer(private3: bool) {
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    // Each relay test binds its own port: the harness runs tests in parallel
+    // and a hardcoded port would make sibling runs fail on AddrInUse.
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(18099);
+    let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    let port = port.to_string();
 
     let out = "/tmp/fj-e2e-relay";
     fresh_dir(out);
     let sender_bin = fj_e2e::cli::bin_path();
     let relay_bin = fj_e2e::cli::relay_bin_path();
-    let mut relay = Command::new(&relay_bin)
-        .args(["18099"])
-        .spawn()
-        .expect("spawn relay");
+    // Drop guard: kill the relay even if an assertion panics early, so the
+    // hardcoded port never stays bound by an orphan process.
+    struct RelayGuard(std::process::Child);
+    impl Drop for RelayGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let relay = RelayGuard(
+        Command::new(&relay_bin)
+            .args([&port])
+            .spawn()
+            .expect("spawn relay"),
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
 
+    let mut sender_args = vec![
+        "send".to_string(),
+        "../fixtures/random.bin".to_string(),
+        "--json".to_string(),
+        "--stun".to_string(),
+        "none".to_string(),
+        "--relay".to_string(),
+        format!("ws://127.0.0.1:{port}/ws"),
+    ];
+    if private3 {
+        sender_args.push("--private".to_string());
+    }
     let mut sender = Command::new(sender_bin.clone())
-        .args([
-            "send",
-            "../fixtures/random.bin",
-            "--json",
-            "--stun",
-            "none",
-            "--relay",
-            "ws://127.0.0.1:18099/ws",
-        ])
+        .args(&sender_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -455,7 +488,7 @@ fn cli_relay_pairing() {
             "--stun",
             "none",
             "--relay",
-            "ws://127.0.0.1:18099/ws",
+            &format!("ws://127.0.0.1:{port}/ws"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -511,11 +544,10 @@ fn cli_relay_pairing() {
     let rc = rcode.code().unwrap_or(-1);
     if sc != 0 || rc != 0 {
         panic!(
-            "relay transfer failed: sender={sc} receiver={rc}\n--- receiver stderr ---\n{rerr_out}"
+            "relay transfer failed (private3={private3}): sender={sc} receiver={rc}\n--- receiver stderr ---\n{rerr_out}"
         );
     }
-    let _ = relay.kill();
-    let _ = relay.wait();
+    drop(relay);
     assert_eq!(
         sha256_file(&format!("{out}/random.bin")),
         sha256_file("../fixtures/random.bin"),

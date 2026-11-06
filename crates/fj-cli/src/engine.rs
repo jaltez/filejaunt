@@ -71,9 +71,10 @@ pub struct Engine {
     pub ice: IceConfig,
     pub channels: usize,
     pub yes: bool,
+    /// resume: passphrase known up-front (prompt suppressed)
     pub passphrase_prompt: Option<String>,
     /// relay URL for pairing-blob transport (None = manual paste mode)
-    pub relay_url: Option<String>, // resume: passphrase known up-front
+    pub relay_url: Option<String>,
     /// file id -> absolute source path (sender side; used to wrap state)
     pub sources: std::cell::RefCell<Vec<PathBuf>>,
 }
@@ -972,6 +973,8 @@ impl Engine {
                 }
             }
         };
+        // Relay mode MITM check: both screens must show the same checksum.
+        self.show_checksum(&session, relay.is_some());
 
         let frames = wire_frames(&peer, channels.max(self.channels)).await;
         let mut rx = Receiver {
@@ -1070,7 +1073,10 @@ impl Engine {
         limiter: &mut AttemptLimiter,
         relay: Option<&RelayHandle>,
     ) -> Result<(), ErrorCode> {
-        let blob3 = read_blob_field(self.out.mode, "blob3")?;
+        let blob3 = match relay {
+            Some(rc) => rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?,
+            None => read_blob_field(self.out.mode, "blob3")?,
+        };
         let offer = session
             .responder_private_offer(&blob3, limiter)
             .map_err(|e| {
@@ -1377,7 +1383,6 @@ impl RelayHandle {
         // drive the websocket with two forwarders: inbound → blob_rx,
         // outbound ← out_rx (std channels; no select needed)
         let in_tx = blob_tx.clone();
-        let _out_tx2 = out_tx.clone();
         tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
                 let tokio_tungstenite::tungstenite::Message::Text(line) = m else {
@@ -1424,6 +1429,7 @@ impl RelayHandle {
         loop {
             match self.inbound.recv_timeout(Duration::from_secs(120)) {
                 Ok(RelayEvent::PeerJoined) => return Ok(()),
+                Ok(RelayEvent::Gone) => return Err(ErrorCode::IceFailed),
                 Ok(_) => continue,
                 Err(_) => return Err(ErrorCode::IceFailed),
             }
@@ -1444,6 +1450,7 @@ impl RelayHandle {
             }
             match self.inbound.recv_timeout(Duration::from_millis(200)) {
                 Ok(RelayEvent::Blob(b)) => return Ok(b),
+                Ok(RelayEvent::Gone) => return Err(ErrorCode::IceFailed),
                 Ok(_) => continue,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => {

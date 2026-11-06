@@ -1811,8 +1811,8 @@ impl Session {
         let k = self.k_confirm.as_ref()?;
         let d = sha2::Sha256::digest(**k);
         let hex = hex::encode(d);
-        let upper = hex[..4].to_uppercase();
-        Some(format!("{} {}", &upper[..2], &upper[2..]))
+        let upper = hex[..8].to_uppercase();
+        Some(format!("{} {}", &upper[..4], &upper[4..]))
     }
 
     /// Whether this session uses private (p3) pairing (restored on resume).

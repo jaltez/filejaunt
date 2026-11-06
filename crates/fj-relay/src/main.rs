@@ -15,7 +15,7 @@
 //!                    | {"t":"error","msg":"..."}
 //!
 //! Limits: room id ≤ 64 hex chars, message ≤ 256 KiB, max 2 peers/room,
-//! rooms reaped after 10 minutes idle. Run behind a TLS-terminating reverse
+//! rooms (with no connected peers) reaped after 10 minutes idle. Run behind a TLS-terminating reverse
 //! proxy in production (clients use wss://).
 
 use std::collections::HashMap;
@@ -79,9 +79,11 @@ struct AppState {
 
 fn now_line(kind: &str, extra: &str) -> String {
     if extra.is_empty() {
-        format!("{{\"t\":\"{kind}\"}}")
+        serde_json::json!({ "t": kind }).to_string()
     } else {
-        format!("{{\"t\":\"{kind}\",\"data\":\"{extra}\"}}")
+        // serde_json escapes client-supplied data: a hostile peer cannot
+        // forge fields or emit invalid JSON downstream.
+        serde_json::json!({ "t": kind, "data": extra }).to_string()
     }
 }
 
@@ -103,15 +105,13 @@ async fn reap(state: AppState) {
             let ids: Vec<String> = reg
                 .rooms
                 .iter()
-                .filter(|(_, r)| r.last.elapsed() > IDLE)
+                .filter(|(_, r)| r.last.elapsed() > IDLE && r.peers.iter().flatten().count() == 0)
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &ids {
-                if let Some(r) = reg.rooms.remove(id) {
+                // Filter guarantees no connected peers remain.
+                if reg.rooms.remove(id).is_some() {
                     count += 1;
-                    for p in r.peers.iter().flatten() {
-                        let _ = p.tx.send(now_line("error", "room idle timeout"));
-                    }
                 }
             }
         }
