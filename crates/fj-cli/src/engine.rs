@@ -509,16 +509,29 @@ impl Engine {
         })?;
         self.show_checksum(&session, relay.is_some());
         if effective_private3 {
-            let Some(rc) = relay.as_ref() else {
-                eprintln!("p3 resume requires --relay (restored session is private)");
-                return Err(ErrorCode::ProtoMalformed);
-            };
             let blob3 = session.initiator_private_blob3().map_err(|e| {
                 eprintln!("[{}] {}", e.code(), e.msg());
                 ErrorCode::SecPakeFailed
             })?;
-            rc.send_blob(&blob3).map_err(|_| ErrorCode::IceFailed)?;
-            let blob4 = rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?;
+            let blob4 = match relay.as_ref() {
+                Some(rc) => {
+                    rc.send_blob(&blob3).map_err(|_| ErrorCode::IceFailed)?;
+                    rc.recv_blob().await.map_err(|_| ErrorCode::IceFailed)?
+                }
+                None => {
+                    match self.out.mode {
+                        Mode::Json => self
+                            .out
+                            .json(serde_json::json!({"type": "blob3", "blob3": blob3})),
+                        Mode::Human => {
+                            eprintln!("blob-3 (paste into the receiver):");
+                            println!("{blob3}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                    read_blob_field(self.out.mode, "blob4")?
+                }
+            };
             session.initiator_private_final(&blob4).map_err(|e| {
                 eprintln!("[{}] {}", e.code(), e.msg());
                 ErrorCode::SecPakeFailed
@@ -1419,9 +1432,7 @@ impl RelayHandle {
 
     pub fn send_blob(&self, blob: &str) -> Result<(), ErrorCode> {
         let line = serde_json::json!({ "t": "msg", "data": blob }).to_string();
-        self.outbound
-            .send(line)
-            .map_err(|_| ErrorCode::IceFailed)
+        self.outbound.send(line).map_err(|_| ErrorCode::IceFailed)
     }
 
     /// Receive the next blob (timeout: dead relay / peer never sent).

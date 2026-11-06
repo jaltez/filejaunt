@@ -424,7 +424,7 @@ fn cli_relay_pairing() {
     fresh_dir(out);
     let sender_bin = fj_e2e::cli::bin_path();
     let relay_bin = fj_e2e::cli::relay_bin_path();
-    let relay = Command::new(&relay_bin)
+    let mut relay = Command::new(&relay_bin)
         .args(["18099"])
         .spawn()
         .expect("spawn relay");
@@ -514,6 +514,8 @@ fn cli_relay_pairing() {
             "relay transfer failed: sender={sc} receiver={rc}\n--- receiver stderr ---\n{rerr_out}"
         );
     }
+    let _ = relay.kill();
+    let _ = relay.wait();
     assert_eq!(
         sha256_file(&format!("{out}/random.bin")),
         sha256_file("../fixtures/random.bin"),
