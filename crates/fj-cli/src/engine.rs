@@ -23,6 +23,7 @@ use fj_webrtc::{IceConfig, PeerHandle};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::store::Store;
+use crate::ui;
 use crate::ui::{Mode, Out};
 
 pub const PUBLIC_STUN: &[&str] = &[
@@ -79,7 +80,7 @@ impl Engine {
     /// Structured failure: stderr line always; NDJSON `error` event in --json
     /// mode (the documented event contract).
     fn fail_event(&self, code: ErrorCode, msg: &str) -> ErrorCode {
-        eprintln!("[{code}] {msg}");
+        eprintln!("[{code}] {}", ui::sanitize(msg));
         if self.out.mode == Mode::Json {
             self.out.json(serde_json::json!({
                 "type": "error", "code": code.as_str(), "msg": msg,
@@ -369,11 +370,40 @@ impl Engine {
         resume: Option<(&str, &str)>,
         _locals: &[LocalFile],
     ) -> Result<SendCtx, ErrorCode> {
+        // For a resume, the snapshot must be loaded BEFORE the offer is
+        // created: the offer must contain as many data channels as the
+        // original session (the envelope announces `ch`, and the receiver
+        // waits for exactly that many).
+        let restored = match resume {
+            Some((sid, _)) => {
+                let raw = self
+                    .store
+                    .load_session(sid, "send")
+                    .ok_or(ErrorCode::StorageFailed)?;
+                let snap = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|w| {
+                        w.get("session")
+                            .map(|s| s.to_string())
+                            .filter(|s| s != "null")
+                    })
+                    .unwrap_or(raw);
+                Some(Session::restore(&snap).map_err(|e| {
+                    eprintln!("bad session state: {}", e.msg());
+                    ErrorCode::StorageFailed
+                })?)
+            }
+            None => None,
+        };
+        let (channels, private3) = match (&restored, resume) {
+            (Some(s), Some((_, _pass))) => (s.channels().max(1), s.private3()),
+            _ => (self.channels, private3),
+        };
         let peer = PeerHandle::new(&self.ice)
             .await
             .map_err(|_| ErrorCode::IceFailed)?;
         let offer_sdp = peer
-            .create_offer(self.channels)
+            .create_offer(channels)
             .await
             .map_err(|_| ErrorCode::IceFailed)?;
         let (mut session, passphrase, blob1) = match resume {
@@ -389,24 +419,8 @@ impl Engine {
                 eprintln!("pairing failed: {}", e.msg());
                 ErrorCode::SecPakeFailed
             })?,
-            Some((sid, pass)) => {
-                let raw = self
-                    .store
-                    .load_session(sid, "send")
-                    .ok_or(ErrorCode::StorageFailed)?;
-                // sender state is stored as {role, sources, session{...}}
-                let snap = serde_json::from_str::<serde_json::Value>(&raw)
-                    .ok()
-                    .and_then(|w| {
-                        w.get("session")
-                            .map(|s| s.to_string())
-                            .filter(|s| s != "null")
-                    })
-                    .unwrap_or(raw);
-                let mut s = Session::restore(&snap).map_err(|e| {
-                    eprintln!("bad session state: {}", e.msg());
-                    ErrorCode::StorageFailed
-                })?;
+            Some((_sid, pass)) => {
+                let mut s = restored.expect("restored above");
                 let blob1 = s.resume_initiator(pass, &offer_sdp).map_err(|e| {
                     eprintln!("resume pairing failed: {}", e.msg());
                     ErrorCode::SecPakeFailed
@@ -503,7 +517,11 @@ impl Engine {
             .selected_candidate_type()
             .await
             .unwrap_or_else(|| "unknown".into());
-        let kind = if cand == "relay" { "relay" } else { "direct" };
+        let kind = match cand.as_str() {
+            "host" | "srflx" => "direct",
+            "relay" => "relay",
+            _ => "unknown",
+        };
         match self.out.mode {
             Mode::Json => self
                 .out
@@ -692,7 +710,10 @@ impl Engine {
                     Mode::Human => eprintln!("resumed"),
                 }
             }
-            // 2) push one chunk per receiver per round (shared disk read)
+            // 2) push one chunk per receiver per round (shared disk read,
+            // sequential send). Pipelining was tried and reverted: it stalled
+            // CLI transfers; keep the simple, correct loop until a measured
+            // alternative exists (roadmap: throughput work).
             let mut pushed = 0usize;
             for ci in 0..ctxs.len() {
                 let ctx = &mut ctxs[ci];
@@ -715,13 +736,6 @@ impl Engine {
                         .session
                         .push_chunk_data(fi as u16, index, &data)
                         .map_err(|e| e.code())?;
-                    if std::env::var("FJ_DEBUG").is_ok() && index < 2 {
-                        eprintln!(
-                            "[fj-debug pid={}] sender: pushed chunk file={fi} idx={index} wire={}",
-                            std::process::id(),
-                            wire.len()
-                        );
-                    }
                     let ch = (index as usize) % ctx.channels.max(1);
                     ctx.peer
                         .send_backpressured(ch, wire)
@@ -1151,7 +1165,7 @@ impl Engine {
                 Ok(false)
             }
             Action::EmitText(t) => {
-                self.out.stderr_line(&format!("text: {t}"));
+                self.out.stderr_line(&format!("text: {}", ui::sanitize(&t)));
                 Ok(false)
             }
             Action::SessionDone => Ok(true),

@@ -7,7 +7,7 @@
 // fingerprint (HMAC-SHA256 over offer+answer) still detects any SDP
 // substitution, so this keeps p2's authentication guarantees.
 
-import { Hasher, newFjCore, type FjCore, type FjActionJson } from './wasm';
+import { E2E, Hasher, newFjCore, type FjCore, type FjActionJson } from './wasm';
 import { Transport, doctorProbe, type IceConfig, type PathInfo } from './transport';
 import { ReceiverStore, type FjDirHandle, type Sink } from './storage';
 import { StreamPlayer } from './media';

@@ -2,7 +2,7 @@
 
 Transferencia de ficheros P2P navegador↔navegador y navegador↔CLI: cifrada, efímera, sin servidor de signaling y sin relay de datos, con transparencia de ruta verificable como identidad de producto.
 
-- Estado: **semilla** (sin código todavía). Este documento es la fuente de verdad para PRD/beads/impl.
+- Estado: **implementado (v1)** — ver README. Este documento es la fuente de verdad de diseño original; las desviaciones de implementación están en `docs/SECURITY.md` § Desviaciones.
 - Fecha: 2026-11-05
 - Evidencia: investigación completa en `browser-p2p-report-2026.md` y `agents/voyager/20261105-134652-*/` (prompt, plan, fuentes). Citaciones `[n]` al final.
 

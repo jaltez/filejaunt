@@ -630,17 +630,18 @@ impl Session {
         let frame = match self.decrypt(&header, &wire[12..]) {
             Ok(f) => f,
             Err(e) => {
-                if std::env::var("FJ_DEBUG").is_ok() {
-                    eprintln!(
-                        "[fj-debug pid={}] DECRYPT FAIL type=0x{:02x} seq={}",
-                        std::process::id(),
-                        wire[1],
-                        u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]])
-                    );
-                }
                 self.phase = Phase::Failed;
+                // Before the HELO completes, a decryption failure IS a pairing
+                // authentication failure (wrong passphrase / forged peer):
+                // surface SEC_PAKE_FAILED so attempt limiting and exit codes
+                // treat it as a security event, not protocol noise.
+                let code = if self.helo_received {
+                    e.code()
+                } else {
+                    ErrorCode::SecPakeFailed
+                };
                 return Ok(vec![Action::Fail {
-                    code: e.code(),
+                    code,
                     msg: e.msg().to_string(),
                 }]);
             }
@@ -1741,14 +1742,22 @@ impl Session {
         }
         for fs in snap.files {
             if let Some(f) = s.files.iter_mut().find(|f| f.id == fs.id) {
+                let to_bitmap = |b: &BitmapJson| {
+                    b.to_bitmap().map_err(|e| {
+                        crate::error::Error::new(
+                            ErrorCode::StorageFailed,
+                            format!("bad snapshot bitmap: {e}"),
+                        )
+                    })
+                };
                 if let Some(b) = &fs.sent {
-                    f.sent = b.to_bitmap().expect("validated snapshot");
+                    f.sent = to_bitmap(b)?;
                 }
                 if let Some(b) = &fs.acked {
-                    f.acked = b.to_bitmap().expect("validated snapshot");
+                    f.acked = to_bitmap(b)?;
                 }
                 if let Some(b) = &fs.have {
-                    f.have = b.to_bitmap().expect("validated snapshot");
+                    f.have = to_bitmap(b)?;
                 }
                 f.done_claimed = fs.done_claimed;
                 f.done_sent = fs.done_sent;

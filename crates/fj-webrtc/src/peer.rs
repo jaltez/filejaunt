@@ -74,6 +74,10 @@ type FrameCb = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 struct PeerState {
     channels: Mutex<Vec<Option<Arc<webrtc::data_channel::RTCDataChannel>>>>,
     cbs: Mutex<Vec<Option<FrameCb>>>,
+    /// Frames that arrived before a callback was installed (or while the
+    /// registry was momentarily contended) are buffered here per channel and
+    /// flushed on install — a fast sender must never strand the receiver.
+    early: std::sync::Mutex<Vec<std::collections::VecDeque<Vec<u8>>>>,
     expected: AtomicUsize,
     opened: AtomicUsize,
     connected: AtomicBool,
@@ -124,6 +128,7 @@ impl PeerHandle {
         let state = Arc::new(PeerState {
             channels: Mutex::new(vec![]),
             cbs: Mutex::new(vec![]),
+            early: std::sync::Mutex::new(vec![]),
             expected: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
             connected: AtomicBool::new(false),
@@ -292,13 +297,23 @@ impl PeerHandle {
         }
     }
 
-    /// Install a frame callback for channel `ch` (binary messages only).
+    /// Install a frame callback for channel `ch` (binary messages only) and
+    /// flush any frames that arrived before installation.
     pub async fn on_frame(&self, ch: usize, cb: impl Fn(Vec<u8>) + Send + Sync + 'static) {
-        let mut cbs = self.state.cbs.lock().await;
-        if ch >= cbs.len() {
-            cbs.resize(ch + 1, None);
+        let cb: FrameCb = Arc::new(cb);
+        {
+            let mut cbs = self.state.cbs.lock().await;
+            if ch >= cbs.len() {
+                cbs.resize(ch + 1, None);
+            }
+            cbs[ch] = Some(cb.clone());
         }
-        cbs[ch] = Some(Arc::new(cb));
+        let early = self.state.early.lock().unwrap();
+        if let Some(q) = early.get(ch) {
+            for bytes in q.iter() {
+                cb(bytes.clone());
+            }
+        }
     }
 
     /// Send bytes on channel `ch`, honoring the backpressure watermark.
@@ -403,12 +418,28 @@ fn wire_channel(
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             if !msg.is_string {
                 let bytes = msg.data.to_vec();
-                let cb = match state.cbs.try_lock() {
-                    Ok(guard) => guard.get(idx).cloned().flatten(),
-                    Err(_) => None,
-                };
-                if let Some(cb) = cb {
-                    cb(bytes);
+                match state.cbs.try_lock() {
+                    Ok(guard) => {
+                        if let Some(cb) = guard.get(idx).cloned().flatten() {
+                            drop(guard);
+                            cb(bytes);
+                        } else {
+                            // callback not yet installed: buffer for the
+                            // install-time flush
+                            let mut early = state.early.lock().unwrap();
+                            if idx >= early.len() {
+                                early.resize_with(idx + 1, Default::default);
+                            }
+                            early[idx].push_back(bytes);
+                        }
+                    }
+                    Err(_) => {
+                        let mut early = state.early.lock().unwrap();
+                        if idx >= early.len() {
+                            early.resize_with(idx + 1, Default::default);
+                        }
+                        early[idx].push_back(bytes);
+                    }
                 }
             }
             Box::pin(async {})

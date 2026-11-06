@@ -35,7 +35,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::{ErrorCode, Result};
 
@@ -255,9 +255,4 @@ pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
         h.update(p);
     }
     h.finalize().into()
-}
-
-/// Wipes a buffer (used by glue when clearing read buffers).
-pub fn wipe(buf: &mut [u8]) {
-    buf.zeroize();
 }

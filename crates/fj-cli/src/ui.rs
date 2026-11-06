@@ -73,5 +73,13 @@ impl Out {
 }
 
 pub fn human_error(code: &ErrorCode, msg: &str) {
-    eprintln!("error [{code}]: {msg}");
+    eprintln!("error [{code}]: {}", sanitize(msg));
+}
+
+/// Peer-controlled strings (TEXT/ERROR payloads) must not carry terminal
+/// escape sequences: strip C0 controls and DEL before printing.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
 }

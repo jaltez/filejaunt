@@ -2,10 +2,17 @@
 // and wrap the snake_case wasm-bindgen API in a camelCase facade.
 import init, { FjCore as RawFjCore, Hasher as RawHasher, WASM_B64, type FjActionJson } from 'fj-wasm';
 
+// The decrypted answer SDP lives only inside the WASM core; the page applies
+// it with `core.answerSdp()` after initiatorAccept — no clear SDP in any blob.
+
 export type { FjActionJson };
 
 // serde_wasm_bindgen hands back JS Maps for JSON objects; flatten to plain
 // objects so the rest of the app can use property access.
+
+// The test hook (window.__fj.passphrase) is only populated in e2e mode
+// (?e2e=1 in the URL); production pages do not expose it.
+export const E2E = typeof location !== 'undefined' && location.search.includes('e2e');
 function plain(value: unknown): unknown {
   if (value instanceof Map) {
     const out: Record<string, unknown> = {};
@@ -38,7 +45,10 @@ export class FjCore {
   constructor(private readonly raw: RawFjCore) {}
 
   senderStart(words: number, private3: boolean, offerSdp: string, channels: number): SenderStart {
-    return plain(this.raw.sender_start(words, private3, offerSdp, channels)) as SenderStart;
+    const out = plain(this.raw.sender_start(words, private3, offerSdp, channels)) as SenderStart;
+    // the passphrase is only exposed through the hook in e2e mode
+    if (!E2E) out.passphrase = '';
+    return out;
   }
   receiverJoin(blob1: string, passphrase: string, answerSdp: string): string {
     return this.raw.receiver_join(blob1, passphrase, answerSdp);

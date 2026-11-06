@@ -55,6 +55,9 @@ este repositorio. No hay bounty; respuesta de cortesía en <7 días.
   candidatos mDNS no resuelven contra webrtc-rs).
 - El reproductor puede rechazar un fichero; la transferencia nunca falla por
   el player.
+- Los vectores de `tests/vectors/protocol.json` usan passphrase/sid/secreto
+  SPAKE2 FIJOS, solo para tests (documentado en el propio JSON): no sirven
+  para atacar sesiones reales (sid real es OsRng, claves efímeras).
 - Versión web v1: un receptor por pestaña (el fan-out multi-receptor es solo
   CLI); el resume exige el mismo backend de almacenamiento (OPFS) y misma
   pestaña/perfil — el snapshot no se reanuda contra un directorio FSA elegido
@@ -65,7 +68,7 @@ este repositorio. No hay bounty; respuesta de cortesía en <7 días.
 ```sh
 git checkout <tag> && cargo build --release --locked -p fj-cli
 scripts/publish-app.sh          # imprime sha256 del HTML
-sha256sum -c dist/filejaunt.html.sha256
+(cd web/dist && sha256sum -c filejaunt.html.sha256)
 ```
 
 El CI corre fmt + clippy(-D warnings) + tests + fuzz(60s) + wasm parity +

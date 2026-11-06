@@ -104,12 +104,19 @@ fn wrong_version_and_role_rejected() {
     acts.clear(); // drop the real HELO
     // text frame before HELO -> first frame must be HELO
     let text = r2.send_text("early").unwrap();
+    // This self-addressed TEXT decrypts with the wrong direction key, so the
+    // failure surfaces as SEC_PAKE_FAILED (pre-HELO pairing failure, see
+    // on_frame classification); the semantic point is that ANY non-HELO
+    // first frame fails the session.
     let back = r2.on_frame(&text).unwrap();
-    assert!(matches!(
-        back[0],
-        Action::Fail {
-            code: ErrorCode::ProtoMalformed,
-            ..
-        }
-    ));
+    assert!(
+        back.iter().any(|a| matches!(
+            a,
+            Action::Fail {
+                code: ErrorCode::ProtoMalformed | ErrorCode::SecPakeFailed,
+                ..
+            }
+        )),
+        "pre-HELO non-HELO frame must fail the session: {back:?}"
+    );
 }

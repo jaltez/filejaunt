@@ -31,7 +31,13 @@ pub fn generate(n: usize) -> Result<String> {
     }
     let mut words = Vec::with_capacity(n);
     for _ in 0..n {
-        let v = (rand::random::<u16>() as usize) % 7776;
+        // rejection sampling: no modulo bias (65536 % 7776 != 0)
+        let v = loop {
+            let cand = rand::random::<u16>() as usize;
+            if cand < 7776 * 4 {
+                break cand % 7776;
+            }
+        };
         words.push(wl[v]);
     }
     Ok(words.join("-"))

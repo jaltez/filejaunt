@@ -139,12 +139,12 @@ export async function senderAccept(page: Page, blobOut: string): Promise<void> {
 }
 
 export async function startSender(page: Page): Promise<void> {
-  await page.goto(APP);
+  await page.goto('/filejaunt?e2e=1');
   await page.click('#btn-send');
 }
 
 export async function startReceiver(page: Page): Promise<void> {
-  await page.goto(APP);
+  await page.goto('/filejaunt?e2e=1');
   await page.click('#btn-recv');
 }
 
