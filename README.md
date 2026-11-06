@@ -69,3 +69,9 @@ cd web && node build.mjs && cd ../e2e && npx playwright test
 
 Documented deviations from the seed design are listed in
 [`docs/SECURITY.md`](docs/SECURITY.md#deviations).
+
+## Licencia
+
+AGPL-3.0-only — uso, estudio, modificación y redistribución libres. Cualquier
+servicio de red derivado debe publicar su código fuente modificado (sección
+13 de la licencia). Ver [`LICENSE`](LICENSE).

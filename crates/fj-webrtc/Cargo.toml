@@ -3,7 +3,7 @@ name = "fj-webrtc"
 version = "0.1.0"
 edition = "2024"
 description = "filejaunt WebRTC glue: webrtc-rs peer wrapper, STUN client, NAT classifier"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [dependencies]
 fj-protocol = { path = "../fj-protocol" }
