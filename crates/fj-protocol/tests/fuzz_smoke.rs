@@ -46,7 +46,7 @@ fn fuzz_smoke_frame_and_envelope() {
         let b64: String = body
             .iter()
             .enumerate()
-            .map(|(j, b)| if j == i { (*b % 64) as u8 } else { *b })
+            .map(|(j, b)| if j == i { *b % 64 } else { *b })
             .map(|b| {
                 let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
                 alphabet[b as usize % 64] as char
