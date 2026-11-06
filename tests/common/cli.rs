@@ -10,17 +10,18 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Path to the freshly built `filejaunt` binary (workspace build happens
-/// before any test runs; profile follows this test binary's profile).
-pub fn bin_path() -> &'static str {
-    if cfg!(debug_assertions) {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/filejaunt")
-    } else {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/filejaunt")
+/// Path to the freshly built `filejaunt` binary. Resolved at runtime across
+/// profiles (a `--release` test run and a debug run can coexist in target/).
+pub fn bin_path() -> String {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../target");
+    for prof in ["release", "debug"] {
+        let p = format!("{base}/{prof}/filejaunt");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
     }
+    format!("{base}/release/filejaunt")
 }
-
-pub const BIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/filejaunt");
 
 pub struct RunResult {
     pub code: Option<i32>,

@@ -21,15 +21,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - name: e2e (loopback, networked doctor excluded by default)
-        run: cargo test --workspace --release -- --ignored
+      # build the exact profile the e2e harness runs, then run it
+      - run: cargo build --workspace --release
+      - run: cargo test --workspace --release -- --ignored --test-threads=1
 
   fuzz:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -80,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          arguments: check advisories licenses
+          tool: cargo-deny
+      - run: cargo deny check advisories bans licenses sources

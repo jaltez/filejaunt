@@ -12,7 +12,7 @@ fn fresh_dir(p: &str) {
 #[test]
 #[ignore]
 fn cli_doctor_offline() {
-    let out = Command::new(bin_path())
+    let out = Command::new(fj_e2e::cli::bin_path())
         .args(["doctor", "--stun", "none"])
         .output()
         .unwrap();
@@ -203,7 +203,8 @@ fn cli_fanout_two_receivers() {
     fresh_dir(out2);
 
     let bin = bin_path();
-    let mut sender = Command::new(bin)
+    let sender_bin = bin.clone();
+    let mut sender = Command::new(sender_bin)
         .args([
             "send",
             "../fixtures/random.bin",
@@ -219,7 +220,8 @@ fn cli_fanout_two_receivers() {
         .spawn()
         .unwrap();
     let mk = |out: &str| {
-        Command::new(bin)
+        let b = bin.clone();
+        Command::new(b)
             .args(["receive", "--out", out, "--json", "--yes", "--stun", "none"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -323,7 +325,7 @@ fn cli_fanout_two_receivers() {
 #[test]
 #[ignore = "networked: probes public STUN"]
 fn cli_doctor_public() {
-    let out = Command::new(bin_path())
+    let out = Command::new(fj_e2e::cli::bin_path())
         .args(["doctor", "--stun", "public"])
         .output()
         .unwrap();
