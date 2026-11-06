@@ -9,3 +9,6 @@ crates/fj-wasm/pkg/
 web/dist/
 .omp/
 fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
