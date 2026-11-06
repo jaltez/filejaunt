@@ -13,6 +13,7 @@ export type { FjActionJson };
 // The test hook (window.__fj.passphrase) is only populated in e2e mode
 // (?e2e=1 in the URL); production pages do not expose it.
 export const E2E = typeof location !== 'undefined' && location.search.includes('e2e');
+
 function plain(value: unknown): unknown {
   if (value instanceof Map) {
     const out: Record<string, unknown> = {};
@@ -45,10 +46,7 @@ export class FjCore {
   constructor(private readonly raw: RawFjCore) {}
 
   senderStart(words: number, private3: boolean, offerSdp: string, channels: number): SenderStart {
-    const out = plain(this.raw.sender_start(words, private3, offerSdp, channels)) as SenderStart;
-    // the passphrase is only exposed through the hook in e2e mode
-    if (!E2E) out.passphrase = '';
-    return out;
+    return plain(this.raw.sender_start(words, private3, offerSdp, channels)) as SenderStart;
   }
   receiverJoin(blob1: string, passphrase: string, answerSdp: string): string {
     return this.raw.receiver_join(blob1, passphrase, answerSdp);

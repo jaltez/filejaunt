@@ -1,5 +1,9 @@
-// Single-file build: bundles src/main.ts with the wasm-bindgen glue and the
-// WASM binary inlined as base64, then inlines everything into dist/filejaunt.html.
+// Build outputs:
+//   dist/fj.js        — the DOM-free library (ESM, wasm inlined as base64)
+//   dist/filejaunt.html — the single-file example app (library + minimal DOM)
+//
+// The library is what filejaunt.com's app consumes; the example is the
+// copy-paste reference for anyone embedding filejaunt in their own page.
 import { build } from 'esbuild';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -24,7 +28,7 @@ if (!existsSync(join(pkg, 'filejaunt_wasm_bg.wasm'))) {
 }
 
 // The glue's default fetch path is never used (we always pass bytes); drop the
-// import.meta.url reference so the iife bundle stays CSP-clean (no fetch).
+// import.meta.url reference so bundles stay CSP-clean (no fetch).
 const glue = readFileSync(join(pkg, 'filejaunt_wasm.js'), 'utf8').replace(
   /new URL\('filejaunt_wasm_bg\.wasm', import\.meta\.url\)/,
   'undefined',
@@ -42,23 +46,30 @@ const fjWasmPlugin = {
   },
 };
 
-const result = await build({
-  entryPoints: [join(here, 'src/main.ts')],
+const shared = {
   bundle: true,
-  format: 'iife',
   target: 'es2022',
   write: false,
   plugins: [fjWasmPlugin],
   legalComments: 'none',
-});
+};
 
-const js = result.outputFiles[0].text.replace(/<\/script>/g, '<\\/script>');
+mkdirSync(join(here, 'dist'), { recursive: true });
+
+// 1. Library: ESM, all exports intact, importable as `import { Jaunt } from './fj.js'`.
+const lib = await build({ ...shared, entryPoints: [join(here, 'src/library.ts')], format: 'esm' });
+const libOut = join(here, 'dist', 'fj.js');
+writeFileSync(libOut, lib.outputFiles[0].text);
+console.log(`wrote ${libOut} (${(lib.outputFiles[0].text.length / 1024 / 1024).toFixed(2)} MiB)`);
+
+// 2. Example app: IIFE inlined into the reference HTML.
+const example = await build({ ...shared, entryPoints: [join(here, 'src/main.ts')], format: 'iife' });
+const js = example.outputFiles[0].text.replace(/<\/script>/g, '<\\/script>');
 const html = readFileSync(join(here, 'index.html'), 'utf8').replace(
   '<!--FJ_SCRIPT-->',
   () => `<script type="module">\n${js}\n</script>`,
 );
-mkdirSync(join(here, 'dist'), { recursive: true });
-const out = join(here, 'dist', 'filejaunt.html');
-writeFileSync(out, html);
+const htmlOut = join(here, 'dist', 'filejaunt.html');
+writeFileSync(htmlOut, html);
 const mib = html.length / (1024 * 1024);
-console.log(`wrote ${out} (${mib.toFixed(2)} MiB${mib > 5 ? ' — single file kept despite >5 MiB' : ''})`);
+console.log(`wrote ${htmlOut} (${mib.toFixed(2)} MiB${mib > 5 ? ' — single file kept despite >5 MiB' : ''})`);

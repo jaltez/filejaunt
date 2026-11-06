@@ -18,11 +18,12 @@ completa está en [`docs/SEED.md`](docs/SEED.md); el modelo de seguridad en
 ## Quickstart
 
 ```sh
-# web app (single self-contained HTML)
+# web library + reference app
 cargo install wasm-pack
 wasm-pack build crates/fj-wasm --target web --out-dir pkg --out-name filejaunt_wasm
 cd web && npm install && node build.mjs
-# open web/dist/filejaunt.html on two machines (copy/paste code + blob)
+# dist/fj.js          DOM-free library (ESM, wasm inlined); see docs/LIBRARY.md
+# dist/filejaunt.html minimal reference app; open it in two tabs or two machines
 
 # CLI
 cargo install --path crates/fj-cli
@@ -59,7 +60,7 @@ crates/fj-wasm       wasm-bindgen facade for the web client
 crates/xtask         dev tasks (`cargo xtask gen-vectors`)
 fuzz/                cargo-fuzz targets (frame_decode, envelope_parse)
 tests/               multi-process CLI e2e + protocol vectors
-web/                 TypeScript client, single-file build
+web/                 DOM-free TS engine (library) + minimal reference app
 e2e/                 Playwright browser suite
 ```
 
