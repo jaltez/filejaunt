@@ -12,10 +12,11 @@
 // fingerprint (HMAC-SHA256 over offer+answer) still detects any SDP
 // substitution, so this keeps p2's authentication guarantees.
 
-import { E2E, Hasher, newFjCore, type FjCore, type FjActionJson } from './wasm';
+import { E2E, Hasher, newFjCore, parsePairingCode, roomFromPassphrase, type FjCore, type FjActionJson } from './wasm';
 import { Transport, doctorProbe, type DoctorResult, type IceConfig, type PathInfo } from './transport';
 import { ReceiverStore, type FjDirHandle, type Sink } from './storage';
 import type { Bytes } from './storage';
+import { RelayChannel } from './relay';
 
 const CHUNK = 16384;
 const HASH_FEED_SLICE = 1 << 20;
@@ -43,6 +44,11 @@ export interface JauntEvents {
   step(text: string): void;
   state(state: JauntState): void;
   passphrase(text: string): void;
+  /** Relay pairing: the one-line `fj-<room8>-<words>` code to hand to the peer. */
+  pairingCode(code: string): void;
+  /** Relay pairing: "XXXX XXXX" — must match on both screens, else the
+   *  signaling channel is MITM'd. Paste mode never emits this. */
+  checksum(sum: string): void;
   blobOut(blob: string): void;
   files(files: FileView[]): void;
   text(text: string): void;
@@ -65,6 +71,10 @@ export interface JauntOptions {
   events?: Partial<JauntEvents>;
   /** ICE servers for each new peer connection (defaults to none = LAN only). */
   getIce?: () => IceConfig;
+  /** Signaling relay URL (wss://…) for one-line-code pairing; null/empty
+   *  keeps the paste (blob) flow — the default. Self-hosted fj-relay only;
+   *  the relay sees the room id and ciphertext, never keys or SDP in clear. */
+  getRelay?: () => string | null;
   /** Called when the incoming manifest contains an mp4; return null to skip playback. */
   createPlayer?: () => JauntPlayer | null;
 }
@@ -110,6 +120,10 @@ export interface JauntHook {
   path: string;
   sid: string;
   passphrase: string;
+  /** Relay pairing: the one-line `fj-<room8>-<words>` code ('' in paste mode). */
+  code: string;
+  /** Relay pairing: "XXXX XXXX" verification checksum ('' until paired). */
+  checksum: string;
   blob1: string;
   log: string[];
   receipts: unknown[];
@@ -227,6 +241,8 @@ const NO_EVENTS: JauntEvents = {
   step: () => {},
   state: () => {},
   passphrase: () => {},
+  pairingCode: () => {},
+  checksum: () => {},
   blobOut: () => {},
   files: () => {},
   text: () => {},
@@ -246,6 +262,7 @@ export class Jaunt {
 
   private readonly events: JauntEvents;
   private readonly getIce: () => IceConfig;
+  private readonly getRelay: (() => string | null) | undefined;
   private readonly createPlayer: (() => JauntPlayer | null) | undefined;
 
   private core: FjCore | null = null;
@@ -261,6 +278,11 @@ export class Jaunt {
   private channelCount = 1;
   private manifestLoaded = false;
   private chain: Promise<void> = Promise.resolve();
+  private relayMode = false;
+  private relay: RelayChannel | null = null;
+  /** True while a relay exchange drives onProcess: resetSession() (run at
+   *  the top of receiverJoin) must not tear the channel down. */
+  private relayBusy = false;
   private pumpGen = 0;
   private badgeTimer = 0;
   private lastIce: IceConfig = { stunUrls: [] };
@@ -269,6 +291,7 @@ export class Jaunt {
   private constructor(opts: JauntOptions) {
     this.events = { ...NO_EVENTS, ...opts.events };
     this.getIce = opts.getIce ?? (() => ({ stunUrls: [] }));
+    this.getRelay = opts.getRelay;
     this.createPlayer = opts.createPlayer;
     this.hook = {
       state: 'idle',
@@ -279,6 +302,8 @@ export class Jaunt {
       path: '',
       sid: '',
       passphrase: '',
+      code: '',
+      checksum: '',
       blob1: '',
       log: [],
       receipts: [],
@@ -313,6 +338,59 @@ export class Jaunt {
   /** Feed the engine the blob pasted from the other side (state machine). */
   async process(blob: string, passphrase: string): Promise<void> {
     await this.onProcess(blob.trim(), passphrase.trim());
+  }
+
+  /** Relay pairing: paste the peer's one-line code (`fj-<room8>-<words>`,
+   *  or a bare passphrase — the room is derived from it). The blobs cross
+   *  through a self-hosted fj-relay room; nothing is pasted by hand. Needs
+   *  JauntOptions.getRelay to return a URL, else it fails with a step hint. */
+  async pair(code: string): Promise<void> {
+    const url = this.getRelay?.() || null;
+    if (!url) {
+      this.events.step('no relay configured — pair by pasting blobs instead');
+      this.log('relay pairing requested but getRelay() is empty');
+      return;
+    }
+    this.roleValue = 'receiver';
+    this.expect = 'recv-blob1';
+    if (!this.core) this.core = await newFjCore();
+    const parsed = await parsePairingCode(code);
+    const pass = parsed ? parsed.passphrase : code.trim();
+    const room = parsed ? parsed.room : await roomFromPassphrase(pass);
+    this.relayMode = true;
+    this.relayBusy = true;
+    this.setState('pairing');
+    let rc: RelayChannel;
+    try {
+      rc = await RelayChannel.connect(url, room);
+    } catch (e) {
+      this.relayBusy = false;
+      this.fail(`relay connect failed: ${e}`);
+      return;
+    }
+    this.relay = rc;
+    rc.onGone = (reason) => {
+      if (this.hook.state === 'pairing' || this.hook.state === 'idle') this.fail(`relay: ${reason}`);
+    };
+    this.log(`relay pairing: room ${room}`);
+    try {
+      this.events.step('waiting for the sender…');
+      const blob1 = await rc.nextBlob();
+      const blob2 = await this.onProcess(blob1, pass);
+      if (blob2) rc.send(blob2);
+      if ((this.expect as Expect) === 'recv-blob3') {
+        const blob3 = await rc.nextBlob();
+        const blob4 = await this.onProcess(blob3, '');
+        if (blob4) rc.send(blob4);
+      }
+      rc.close();
+    } catch (e) {
+      rc.close();
+      if (this.hook.state !== 'failed') this.fail(`relay exchange failed: ${e}`);
+    } finally {
+      this.relayBusy = false;
+      this.relay = null;
+    }
   }
 
   /** Re-pair the same session with a receiver after a drop (same passphrase). */
@@ -368,10 +446,17 @@ export class Jaunt {
     return this.transport ? this.transport.pathInfo() : null;
   }
 
+  /** True when the current pairing runs over a signaling relay. */
+  get isRelay(): boolean {
+    return this.relayMode;
+  }
+
   /** Close transport and timers. The engine is unusable afterwards. */
   destroy(): void {
     this.pumpGen++;
     clearInterval(this.badgeTimer);
+    this.relay?.close();
+    this.relay = null;
     this.transport?.close();
     this.transport = null;
   }
@@ -725,6 +810,12 @@ export class Jaunt {
    * the previous run's files, player, storage handles or pairing step. */
   private resetSession(): void {
     this.pumpGen++;
+    // a relay exchange in flight owns its channel (receiverJoin runs this at
+    // its start); only teardown when no exchange is driving the pairing
+    if (!this.relayBusy) {
+      this.relay?.close();
+      this.relay = null;
+    }
     this.transport?.close();
     this.transport = null;
     this.player = null;
@@ -739,6 +830,8 @@ export class Jaunt {
     this.hook.wireBytes = 0;
     this.hook.path = '';
     this.hook.blob1 = '';
+    this.hook.code = '';
+    this.hook.checksum = '';
     this.hook.receipts = [];
     this.events.reset();
     this.events.blobOut('');
@@ -804,10 +897,63 @@ export class Jaunt {
     this.manifestLoaded = true;
     this.emitFiles();
     this.events.passphrase(this.passphrase);
+    const relayUrl = this.getRelay?.() || null;
+    this.relayMode = !!relayUrl;
+    if (relayUrl) {
+      const room = await roomFromPassphrase(this.passphrase);
+      const code = `fj-${room}-${this.passphrase}`;
+      this.hook.code = code;
+      this.events.pairingCode(code);
+      this.events.step('send the one-line code; pairing finishes by itself');
+      this.expect = 'sender-blob2';
+      this.log(`pairing ready (mode ${this.privatePairing ? 'p3' : 'p2'}, channels ${this.channelCount}, sid ${this.hook.sid}, relay room ${room})`);
+      void this.senderRelayExchange(relayUrl, room);
+      return;
+    }
+    this.hook.code = '';
     this.events.blobOut(started.blob1);
     this.events.step('paste blob-1 into the receiver, then paste its blob-2 here');
     this.expect = 'sender-blob2';
     this.log(`pairing ready (mode ${this.privatePairing ? 'p3' : 'p2'}, channels ${this.channelCount}, sid ${this.hook.sid})`);
+  }
+
+  /** Relay pairing (sender side): exchange blob-1/2 (and 3/4 for p3) through
+   *  the relay room instead of pasting. Runs on after send() resolves; the
+   *  initiator speaks first, and only once the receiver joined the room. */
+  private async senderRelayExchange(url: string, room: string): Promise<void> {
+    this.relayBusy = true;
+    let rc: RelayChannel;
+    try {
+      rc = await RelayChannel.connect(url, room);
+    } catch (e) {
+      this.relayBusy = false;
+      this.fail(`relay connect failed: ${e}`);
+      return;
+    }
+    this.relay = rc;
+    rc.onGone = (reason) => {
+      if (this.hook.state === 'pairing') this.fail(`relay: ${reason}`);
+    };
+    try {
+      this.events.step('waiting for the receiver…');
+      await rc.waitPeer();
+      rc.send(this.hook.blob1);
+      const blob2 = await rc.nextBlob();
+      const blob3 = await this.onProcess(blob2, '');
+      if (this.privatePairing) {
+        if (!blob3) throw new Error('blob-3 missing after initiator accept');
+        rc.send(blob3);
+        const blob4 = await rc.nextBlob();
+        await this.onProcess(blob4, '');
+      }
+      rc.close();
+    } catch (e) {
+      rc.close();
+      if (this.hook.state !== 'failed') this.fail(`relay exchange failed: ${e}`);
+    } finally {
+      this.relayBusy = false;
+      this.relay = null;
+    }
   }
 
   private async restartSender(): Promise<void> {
@@ -827,6 +973,19 @@ export class Jaunt {
     this.transport = t;
     this.wireTransport(t);
     this.hook.blob1 = blob1;
+    if (this.relayMode) {
+      const url = this.getRelay?.() || null;
+      const room = url ? await roomFromPassphrase(this.passphrase) : null;
+      if (url && room) {
+        this.hook.code = `fj-${room}-${this.passphrase}`;
+        this.events.pairingCode(this.hook.code);
+        this.events.step('resend the one-line code; pairing finishes by itself');
+        this.expect = 'sender-blob2';
+        this.log('resume pairing: same room (same passphrase)');
+        void this.senderRelayExchange(url, room);
+        return;
+      }
+    }
     this.events.blobOut(blob1);
     this.events.step('paste the new blob-1 into the receiver, then paste its blob-2 here');
     this.expect = 'sender-blob2';
@@ -835,7 +994,8 @@ export class Jaunt {
 
   // -- receiver setup ---------------------------------------------------------
 
-  private async receiverJoin(blob1: string, pass: string): Promise<void> {
+  /** Returns the outbound blob for the peer (blob-2), or null on failure. */
+  private async receiverJoin(blob1: string, pass: string): Promise<string | null> {
     this.resetSession();
     this.setState('pairing');
     let env: Envelope1;
@@ -843,7 +1003,7 @@ export class Jaunt {
       env = await inflateBlob1(blob1);
     } catch (e) {
       this.fail(String(e));
-      return;
+      return null;
     }
     const snapshot = await idbGet(env.sid);
     if (!this.core) this.core = await newFjCore();
@@ -867,15 +1027,17 @@ export class Jaunt {
         blob2 = resuming ? this.core.resumeResponder(blob1, pass, '') : this.core.receiverJoin(blob1, pass, '');
       } catch (e) {
         this.fail(String(e));
-        return;
+        return null;
       }
       this.hook.sid = env.sid;
       this.hook.passphrase = pass;
       this.events.blobOut(blob2);
-      this.events.step('paste blob-2 into the sender, then paste its blob-3 here');
+      this.events.step(
+        this.relayMode ? 'private pairing: exchanging blobs via the relay…' : 'paste blob-2 into the sender, then paste its blob-3 here',
+      );
       this.expect = 'recv-blob3';
       this.log('private pairing: blob-2 ready (PAKE only, no SDP in clear)');
-      return;
+      return blob2;
     }
 
     this.events.step('gathering ICE candidates…');
@@ -886,27 +1048,32 @@ export class Jaunt {
     } catch (e) {
       t.close();
       this.fail(String(e));
-      return;
+      return null;
     }
     this.transport = t;
     this.wireTransport(t);
     this.hook.sid = env.sid;
     this.hook.passphrase = pass;
     this.events.blobOut(blob2);
-    this.events.step('paste blob-2 into the sender; transfer starts when it connects');
+    this.events.step(
+      this.relayMode ? 'pairing complete; connecting' : 'paste blob-2 into the sender; transfer starts when it connects',
+    );
     this.expect = 'none';
     this.setState('paired');
+    this.emitChecksum();
     this.log(`joined session ${env.sid}${resuming ? ' (resume)' : ''}`);
+    return blob2;
   }
 
-  private async receiverBlob3(blob3: string): Promise<void> {
-    if (!this.core) return;
+  /** Returns the outbound blob for the peer (blob-4), or null on failure. */
+  private async receiverBlob3(blob3: string): Promise<string | null> {
+    if (!this.core) return null;
     let offer: string;
     try {
       offer = this.core.responderPrivateOffer(blob3);
     } catch (e) {
       this.fail(String(e));
-      return;
+      return null;
     }
     this.events.step('gathering ICE candidates…');
     const t = await Transport.answerer(this.getIce(), offer);
@@ -916,15 +1083,17 @@ export class Jaunt {
     } catch (e) {
       t.close();
       this.fail(String(e));
-      return;
+      return null;
     }
     this.transport = t;
     this.wireTransport(t);
     this.events.blobOut(blob4);
-    this.events.step('paste blob-4 into the sender');
+    this.events.step(this.relayMode ? 'pairing complete; connecting' : 'paste blob-4 into the sender');
     this.expect = 'none';
     this.setState('paired');
+    this.emitChecksum();
     this.log('private pairing: blob-4 ready');
+    return blob4;
   }
 
   // -- #process -----------------------------------------------------------------
@@ -935,43 +1104,45 @@ export class Jaunt {
     return crlf.endsWith('\r\n') ? crlf : `${crlf}\r\n`;
   }
 
-  private async onProcess(blob: string, pass: string): Promise<void> {
-    if (!blob) return;
+  /** Drive one inbound blob through the pairing state machine. Returns the
+   *  outbound blob it produced for the peer (blob-2/3/4), or null — the
+   *  relay exchange sends that straight to the room instead of a paste. */
+  private async onProcess(blob: string, pass: string): Promise<string | null> {
+    if (!blob) return null;
     if (this.roleValue === 'receiver' && this.expect === 'recv-blob1') {
-      await this.receiverJoin(blob, pass);
-      return;
+      return this.receiverJoin(blob, pass);
     }
     if (this.roleValue === 'receiver' && this.expect === 'recv-blob3') {
-      await this.receiverBlob3(blob);
-      return;
+      return this.receiverBlob3(blob);
     }
     if (this.roleValue === 'sender' && this.expect === 'sender-blob2' && this.core) {
       try {
         this.core.initiatorAccept(blob);
       } catch (e) {
         this.fail(String(e));
-        return;
+        return null;
       }
       if (this.privatePairing) {
         const blob3 = this.core.initiatorPrivateBlob3();
         this.events.blobOut(blob3);
-        this.events.step('paste blob-3 into the receiver, then paste its blob-4 here');
+        this.events.step(this.relayMode ? 'private pairing: exchanging blobs via the relay…' : 'paste blob-3 into the receiver, then paste its blob-4 here');
         this.expect = 'sender-blob4';
         this.log('private pairing: blob-3 ready');
-        return;
+        return blob3;
       }
       await this.senderFinishPairing();
-      return;
+      return null;
     }
     if (this.roleValue === 'sender' && this.expect === 'sender-blob4' && this.core) {
       try {
         this.core.initiatorPrivateFinal(blob);
       } catch (e) {
         this.fail(String(e));
-        return;
+        return null;
       }
       await this.senderFinishPairing();
     }
+    return null;
   }
 
   private async senderFinishPairing(): Promise<void> {
@@ -985,7 +1156,19 @@ export class Jaunt {
     }
     this.expect = 'none';
     this.setState('paired');
+    this.emitChecksum();
     this.events.step('connecting…');
     this.log('pairing complete; connecting');
+  }
+
+  /** Relay pairing only: surface the "XXXX XXXX" checksum both peers must
+   *  compare (a mismatch = MITM in the signaling path). */
+  private emitChecksum(): void {
+    if (!this.relayMode || !this.core) return;
+    const sum = this.core.verifyChecksum();
+    if (!sum) return;
+    this.hook.checksum = sum;
+    this.events.checksum(sum);
+    this.log(`verification checksum: ${sum} — compare on both screens`);
   }
 }

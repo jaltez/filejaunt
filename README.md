@@ -61,6 +61,7 @@ checksum to compare, which detects a MITM in the signaling path.
 | gzip chunk compression (auto/on/off) | done |
 | Multi-channel (4) + fan-out (up to 4 receivers, CLI; web UI is one receiver per tab) | done |
 | Per-file receipts + offline verify | done |
+| One-line pairing via self-hosted relay (`fj-<room8>-<words>` + checksum) | done (CLI + web library) |
 
 ## Layout
 

@@ -346,6 +346,15 @@ impl FjCore {
         self.with_session(|s| Ok(s.sid_hex()))
     }
 
+    /// Visual verification checksum (relay pairing): first 4 bytes of
+    /// SHA-256(K_confirm) as "XXXX XXXX" uppercase hex — identical on both
+    /// peers; a mismatch means the signaling channel is MITM'd. None before
+    /// pairing. Only meaningful over a relay (paste mode trusts the channel
+    /// that carried the blobs plus the HELO fingerprint).
+    pub fn verify_checksum(&self) -> Option<String> {
+        self.session.as_ref().and_then(|s| s.verify_checksum())
+    }
+
     pub fn is_done(&self) -> bool {
         self.session.as_ref().map(|s| s.is_done()).unwrap_or(false)
     }
@@ -542,6 +551,41 @@ pub fn fj_role(core: &FjCore) -> String {
         Some(Role::Initiator) => "initiator".into(),
         Some(Role::Responder) => "responder".into(),
         None => String::new(),
+    }
+}
+
+/// Relay room id: first 8 hex of SHA-256 over the canonical passphrase.
+/// Deterministic so both peers (and resumes) meet in the same room; the
+/// relay cannot invert it. Mirrors the CLI's RelayHandle::room_from_passphrase.
+#[wasm_bindgen]
+pub fn fj_room_from_passphrase(passphrase: &str) -> String {
+    use sha2::Digest;
+    let canon = fj_protocol::pake::canonical_passphrase(passphrase);
+    let digest = sha2::Sha256::digest(canon.as_bytes());
+    hex::encode(digest)[..8].to_string()
+}
+
+/// Split a pasted `fj-<room8>-<words>` one-line pairing code into
+/// {room, passphrase}; null when the input is a bare passphrase (no
+/// 8-hex room prefix). Mirrors the CLI's parse_pairing_code.
+#[derive(serde::Serialize)]
+struct PairingCodeOut {
+    room: String,
+    passphrase: String,
+}
+
+#[wasm_bindgen]
+pub fn fj_parse_pairing_code(input: &str) -> JsValue {
+    let t = input.trim().strip_prefix("fj-").unwrap_or(input.trim());
+    match t.split_once('-') {
+        Some((room, rest)) if room.len() == 8 && room.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            serde_wasm_bindgen::to_value(&PairingCodeOut {
+                room: room.to_ascii_lowercase(),
+                passphrase: rest.trim().to_string(),
+            })
+            .unwrap_or(JsValue::NULL)
+        }
+        _ => JsValue::NULL,
     }
 }
 
@@ -850,5 +894,50 @@ mod parity {
         assert!(l2.done, "session completes after resume");
         assert!(l2.verified, "hash verified after resume");
         assert_eq!(l2.received(0), l2.source, "bytes identical after resume");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ParsedCode {
+        room: String,
+        passphrase: String,
+    }
+
+    #[wasm_bindgen_test]
+    fn pairing_code_helpers_match_cli() {
+        use super::{fj_parse_pairing_code, fj_room_from_passphrase};
+
+        // canonicalization (NFKD, lowercase, separators folded) => one room
+        let a = fj_room_from_passphrase("word-one-word-two");
+        let b = fj_room_from_passphrase("  Word One  word-TWO  ");
+        assert_eq!(a, b, "canonicalization folds to one room");
+        assert_eq!(a.len(), 8);
+        assert!(
+            a.bytes()
+                .all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x)),
+            "lowercase hex"
+        );
+
+        // code round-trip; bare passphrases and malformed rooms parse to null
+        let code = format!("fj-{a}-word-one-word-two");
+        let parsed: ParsedCode =
+            serde_wasm_bindgen::from_value(fj_parse_pairing_code(&code)).unwrap();
+        assert_eq!(parsed.room, a);
+        assert_eq!(parsed.passphrase, "word-one-word-two");
+        assert!(fj_parse_pairing_code("word-one-word-two").is_null());
+        assert!(fj_parse_pairing_code("fj-zzzzzzzz-x").is_null());
+    }
+
+    #[wasm_bindgen_test]
+    fn verify_checksum_matches_on_both_peers() {
+        let l = Loop::new(1 << 10);
+        let ini = l.ini.verify_checksum().expect("checksum after pairing");
+        let rsp = l.rsp.verify_checksum().expect("checksum after pairing");
+        assert_eq!(ini, rsp, "both peers derive the same checksum");
+        assert_eq!(ini.len(), 9, "formatted as XXXX XXXX");
+        assert!(
+            ini.chars()
+                .all(|c| c == ' ' || c.is_ascii_digit() || ('A'..='F').contains(&c)),
+            "uppercase hex"
+        );
     }
 }

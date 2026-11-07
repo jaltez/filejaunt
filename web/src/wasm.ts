@@ -1,6 +1,13 @@
 // WASM bootstrap: decode the inlined base64 wasm, initialize the module once,
 // and wrap the snake_case wasm-bindgen API in a camelCase facade.
-import init, { FjCore as RawFjCore, Hasher as RawHasher, WASM_B64, type FjActionJson } from 'fj-wasm';
+import init, {
+  FjCore as RawFjCore,
+  Hasher as RawHasher,
+  WASM_B64,
+  fj_parse_pairing_code,
+  fj_room_from_passphrase,
+  type FjActionJson,
+} from 'fj-wasm';
 
 // The decrypted answer SDP lives only inside the WASM core; the page applies
 // it with `core.answerSdp()` after initiatorAccept — no clear SDP in any blob.
@@ -117,6 +124,10 @@ export class FjCore {
   sid(): string {
     return this.raw.sid();
   }
+  /** "XXXX XXXX" — equal on both peers after relay pairing; null before. */
+  verifyChecksum(): string | null {
+    return this.raw.verify_checksum() ?? null;
+  }
   offerSdp(): string {
     return this.raw.offer_sdp();
   }
@@ -157,10 +168,32 @@ let ready: Promise<void> | null = null;
 
 /** Create the core once the WASM module is up (initialization is one-shot). */
 export async function newFjCore(): Promise<FjCore> {
+  await ensureReady();
+  return new FjCore(new RawFjCore());
+}
+
+function ensureReady(): Promise<void> {
   if (!ready) {
     ready = init({ module_or_path: b64ToBytes(WASM_B64) }).then(() => undefined);
   }
-  await ready;
-  return new FjCore(new RawFjCore());
+  return ready;
+}
+
+/** Relay room id: first 8 hex of SHA-256 over the canonical passphrase. */
+export async function roomFromPassphrase(passphrase: string): Promise<string> {
+  await ensureReady();
+  return fj_room_from_passphrase(passphrase);
+}
+
+export interface ParsedPairingCode {
+  room: string;
+  passphrase: string;
+}
+
+/** Split `fj-<room8>-<words>` into {room, passphrase}; null for bare input. */
+export async function parsePairingCode(input: string): Promise<ParsedPairingCode | null> {
+  await ensureReady();
+  const parsed = fj_parse_pairing_code(input);
+  return parsed ? (plain(parsed) as ParsedPairingCode) : null;
 }
 

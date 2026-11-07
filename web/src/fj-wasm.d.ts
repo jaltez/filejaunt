@@ -39,6 +39,7 @@ declare module 'fj-wasm' {
     take_actions(): unknown[];
     snapshot(): string;
     restore(json: string): void;
+    verify_checksum(): string | undefined;
     sid(): string;
     is_done(): boolean;
     is_failed(): boolean;
@@ -69,6 +70,9 @@ declare module 'fj-wasm' {
     [k: string]: unknown;
   }
 
+  export function fj_room_from_passphrase(passphrase: string): string;
+  /** {room, passphrase} for a `fj-<room8>-<words>` code, else null. */
+  export function fj_parse_pairing_code(input: string): { room: string; passphrase: string } | null;
   export function fj_role(core: FjCore): string;
   export const WASM_B64: string;
   export default function init(opts?: { module_or_path?: Uint8Array }): Promise<unknown>;
