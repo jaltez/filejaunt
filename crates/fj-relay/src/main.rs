@@ -133,9 +133,25 @@ async fn peer_socket(socket: WebSocket, state: AppState) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
     let pump = tokio::spawn(async move {
-        while let Some(line) = out_rx.recv().await {
-            if tx.send(Message::Text(line)).await.is_err() {
-                break;
+        // Cloudflare's proxy drops idle WebSocket connections after ~100 s.
+        // A protocol-level ping every 30 s keeps the hop alive (browsers and
+        // tokio-tungstenite answer pings automatically); peers waiting
+        // minutes to pair would otherwise be cut mid-handshake.
+        let mut ping = tokio::time::interval(Duration::from_secs(30));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ping.tick() => {
+                    if tx.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+                line = out_rx.recv() => {
+                    let Some(line) = line else { break };
+                    if tx.send(Message::Text(line)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
