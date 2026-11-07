@@ -16,6 +16,10 @@ COPY .cargo .cargo
 COPY crates crates
 COPY tests tests
 
+# rust:1 already tracks the latest stable: drop the toolchain pin or rustup
+# would download a second "stable" toolchain inside the build
+RUN rm -f rust-toolchain.toml
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p fj-relay \
