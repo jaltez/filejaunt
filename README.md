@@ -48,6 +48,19 @@ in the code and the blobs travel through the relay encrypted — the relay
 sees only the room id and ciphertext. Both sides also print an 8-hex
 checksum to compare, which detects a MITM in the signaling path.
 
+### Running the relay in production
+
+```sh
+docker build -t fj-relay .          # repo root: distroless image, non-root
+docker run -p 8088:8088 fj-relay    # wss://your-host/ws behind your proxy
+```
+
+Put TLS on it (any reverse proxy; Dokploy's Traefik just works) and let the
+proxy append the client IP to `X-Forwarded-For` — the relay reads the LAST
+hop for its abuse caps: 8 concurrent sockets per IP, 20 000 total, 10 000
+rooms (2 peers each, idle rooms reaped after 10 min). No state, no config,
+no env vars; `GET /healthz` answers `ok` for uptime checks.
+
 ## Feature status
 
 | Feature | Status |

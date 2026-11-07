@@ -1,0 +1,17 @@
+# keep the build context minimal; the workspace needs only manifests + sources
+.git
+.github
+target
+web
+fixtures
+fuzz
+e2e
+docs
+assets
+scripts
+agents
+browser-p2p-report-2026.md
+*.md
+!README.md
+Dockerfile
+.dockerignore
