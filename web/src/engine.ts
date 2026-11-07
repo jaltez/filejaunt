@@ -369,9 +369,8 @@ export class Jaunt {
       return;
     }
     this.relay = rc;
-    rc.onGone = (reason) => {
-      if (this.hook.state === 'pairing' || this.hook.state === 'idle') this.fail(`relay: ${reason}`);
-    };
+    // no onGone fail-fast (see senderRelayExchange): pending nextBlob
+    // waits reject on their own; leaving after our reply is not an error
     this.log(`relay pairing: room ${room}`);
     try {
       this.events.step('waiting for the sender…');
@@ -383,11 +382,13 @@ export class Jaunt {
         const blob4 = await this.onProcess(blob3, '');
         if (blob4) rc.send(blob4);
       }
-      rc.close();
     } catch (e) {
       rc.close();
       if (this.hook.state !== 'failed') this.fail(`relay exchange failed: ${e}`);
     } finally {
+      // grace close: give the sender time to consume our reply before the
+      // room broadcasts peer-left (it raced applyAnswer behind proxies)
+      setTimeout(() => rc.close(), 750);
       this.relayBusy = false;
       this.relay = null;
     }
@@ -931,9 +932,10 @@ export class Jaunt {
       return;
     }
     this.relay = rc;
-    rc.onGone = (reason) => {
-      if (this.hook.state === 'pairing') this.fail(`relay: ${reason}`);
-    };
+    // no onGone fail-fast: RelayChannel.bye() already rejects any pending
+    // waitPeer/nextBlob, so a REAL mid-exchange death still fails the
+    // session — while the peer leaving after we hold everything must not
+    // (the receiver closes the room as soon as it replied blob-2)
     try {
       this.events.step('waiting for the receiver…');
       await rc.waitPeer();
@@ -946,11 +948,13 @@ export class Jaunt {
         const blob4 = await rc.nextBlob();
         await this.onProcess(blob4, '');
       }
-      rc.close();
     } catch (e) {
       rc.close();
       if (this.hook.state !== 'failed') this.fail(`relay exchange failed: ${e}`);
     } finally {
+      // grace close: the peer may still be digesting our last blob (its
+      // peer-left broadcast used to race applyAnswer behind proxies)
+      setTimeout(() => rc.close(), 750);
       this.relayBusy = false;
       this.relay = null;
     }
