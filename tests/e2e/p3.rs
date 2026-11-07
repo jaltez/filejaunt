@@ -416,11 +416,13 @@ fn cli_cancel_sigint() {
 }
 
 #[test]
+#[ignore] // spawns the built fj-relay binary: run with the release e2e suite
 fn cli_relay_pairing() {
     relay_transfer(false);
 }
 
 #[test]
+#[ignore] // same: needs target/{release,debug}/fj-relay on disk
 fn cli_relay_private_pairing() {
     // p3 (all SDP encrypted) over the signaling relay: blob-3/blob-4 must
     // flow through the relay room on BOTH sides, not stdin/stdout.
