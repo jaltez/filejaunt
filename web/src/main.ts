@@ -131,9 +131,19 @@ async function boot(): Promise<void> {
         privatePairing: ui.qs<HTMLInputElement>('#private3').checked,
         channels: Number(ui.qs<HTMLSelectElement>('#channels').value) || 1,
         gzip: ui.qs<HTMLSelectElement>('#gzip').value as 'auto' | 'on' | 'off',
+        live: ui.qs<HTMLInputElement>('#live').checked,
       })
       .catch((e) => ui.log(`error: ${e}`));
   });
+  ui.qs<HTMLInputElement>('#append-input').addEventListener('change', (e) => {
+    const input = e.target as HTMLInputElement;
+    const files = [...(input.files ?? [])];
+    input.value = '';
+    void jaunt.appendFiles(files).then((ok) => {
+      if (!ok) ui.setStep('append needs a live share with a paired peer');
+    });
+  });
+  ui.qs<HTMLElement>('#end-share').onclick = () => jaunt.endSession();
   ui.qs<HTMLElement>('#process').onclick = () => {
     void jaunt
       .process(ui.qs<HTMLTextAreaElement>('#blob-in').value, ui.qs<HTMLInputElement>('#pass-in').value)

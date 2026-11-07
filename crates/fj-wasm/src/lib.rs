@@ -66,6 +66,7 @@ fn action_to_js(a: Action) -> JsValue {
             "verified": verified,
         }),
         Action::EmitText(text) => serde_json::json!({"t": "text", "text": text}),
+        Action::FilesAdded(files) => serde_json::json!({"t": "filesAdded", "files": files}),
         Action::Receipt(r) => serde_json::json!({"t": "receipt", "receipt": r}),
         Action::SessionDone => serde_json::json!({"t": "done"}),
         Action::Fail { code, msg } => {
@@ -197,9 +198,37 @@ impl FjCore {
     /// Sender: set the file list (gzip resolved per file by the browser
     /// through `resolve_gzip_auto` or its own probe).
     pub fn set_files(&mut self, files_json: &str) -> Result<(), JsValue> {
+        self.set_files_live(files_json, false)
+    }
+
+    /// Like `set_files`, but `live` marks the session as a live share
+    /// (docs/LIVE-SHARE.md).
+    pub fn set_files_live(&mut self, files_json: &str, live: bool) -> Result<(), JsValue> {
         let specs: Vec<fj_protocol::manifest::FileSpec> =
             serde_json::from_str(files_json).map_err(|e| JsValue::from_str(&format!("{e}")))?;
-        self.with_session(|s| s.set_files(&specs).map(|_| ()))
+        self.with_session(|s| s.set_files_live(&specs, live).map(|_| ()))
+    }
+
+    /// Live share: append files to the running session. Actions include
+    /// the APPEND wire frame and, for empty files, immediate DONE frames.
+    pub fn append_files(&mut self, files_json: &str) -> Result<(), JsValue> {
+        let specs: Vec<fj_protocol::manifest::FileSpec> =
+            serde_json::from_str(files_json).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        let actions = self.with_session(|s| s.append_files(&specs))?;
+        for a in actions {
+            self.pending.push(action_to_js(a));
+        }
+        Ok(())
+    }
+
+    /// Live share: leave cleanly (BYE). Actions carry the wire frame and
+    /// the session-done notice.
+    pub fn end_session(&mut self) -> Result<(), JsValue> {
+        let actions = self.with_session(|s| s.end_session())?;
+        for a in actions {
+            self.pending.push(action_to_js(a));
+        }
+        Ok(())
     }
 
     /// gzip "auto" probe helper: returns whether the samples compress.
@@ -357,6 +386,11 @@ impl FjCore {
 
     pub fn is_done(&self) -> bool {
         self.session.as_ref().map(|s| s.is_done()).unwrap_or(false)
+    }
+
+    /// True while this is a live share both sides keep open.
+    pub fn is_live(&self) -> bool {
+        self.session.as_ref().map(|s| s.is_live()).unwrap_or(false)
     }
 
     pub fn is_failed(&self) -> bool {

@@ -29,6 +29,8 @@ export type JauntRole = 'sender' | 'receiver';
 export interface FileView {
   id: number;
   name: string;
+  /** Folder path ("photos/2024"); empty for top-level files. */
+  path: string;
   size: number;
   progress: number; // 0..100
   wireBytes: number;
@@ -85,6 +87,18 @@ export interface SendOptions {
   channels?: number;
   gzip?: 'auto' | 'on' | 'off';
   ice?: IceConfig;
+  /** Live share: keep the session open after the files settle, allow
+   *  appends and chat until either side leaves (needs a peer that
+   *  advertises the capability; old peers fall back to one-shot). */
+  live?: boolean;
+}
+
+/** A file with an explicit folder path, so several directory picks can
+ *  share one session ("photos/2024/img.jpg"). Plain File objects keep
+ *  their webkitRelativePath. */
+export interface ShareEntry {
+  file: File;
+  path: string;
 }
 
 export interface SenderStartResult {
@@ -276,6 +290,7 @@ export class Jaunt {
   private privatePairing = false;
   private passphrase = '';
   private channelCount = 1;
+  private gzipMode: 'auto' | 'on' | 'off' = 'auto';
   private manifestLoaded = false;
   private chain: Promise<void> = Promise.resolve();
   private relayMode = false;
@@ -329,10 +344,11 @@ export class Jaunt {
     this.log(`role: ${role}`);
   }
 
-  /** Pick files (sender side) and start a new session. */
-  async send(files: File[], opts: SendOptions = {}): Promise<void> {
+  /** Pick files (sender side) and start a new session. Entries may carry
+   *  an explicit folder path so several directory picks share one session. */
+  async send(entries: (File | ShareEntry)[], opts: SendOptions = {}): Promise<void> {
     this.roleValue = 'sender';
-    await this.startSender(files, opts);
+    await this.startSender(entries, opts);
   }
 
   /** Feed the engine the blob pasted from the other side (state machine). */
@@ -408,6 +424,70 @@ export class Jaunt {
     } catch (e) {
       this.log(`text send failed: ${e}`);
       return false;
+    }
+  }
+
+  /** True while this is a live share both sides keep open (chat and
+   *  appends allowed until someone leaves). */
+  get isLive(): boolean {
+    return this.hook.state !== 'done' && this.hook.state !== 'failed' && (this.core?.isLive() ?? false);
+  }
+
+  /** Live share: add files to the running session. Hashes first, then
+   *  hands the specs to the core, which emits the APPEND frame. */
+  async appendFiles(entries: (File | ShareEntry)[]): Promise<boolean> {
+    const items = entries.map(normalizeEntry);
+    if (!items.length || !this.core || !this.transport) return false;
+    const specs: { name: string; path: string; size: number; sha256: string; gzip: boolean }[] = [];
+    for (const { file, path } of items) {
+      specs.push({ name: file.name, path, size: file.size, sha256: await this.sha256Hex(file), gzip: this.gzipMode === 'on' });
+    }
+    try {
+      this.core.appendFiles(JSON.stringify(specs));
+      const base = this.recs.length;
+      specs.forEach((s, i) =>
+        this.recs.push({
+          id: base + i,
+          name: s.name,
+          path: s.path,
+          size: s.size,
+          chunks: Math.ceil(s.size / CHUNK),
+          chunkSize: CHUNK,
+          progress: 0,
+          wireBytes: 0,
+          source: items[i].file,
+        }),
+      );
+      if (this.gzipMode === 'auto') {
+        for (let i = 0; i < items.length; i++) {
+          const f = items[i].file;
+          const samples: Uint8Array[] = [];
+          for (let c = 0; c < 4; c++) {
+            const s = new Uint8Array(await f.slice(c * CHUNK, Math.min((c + 1) * CHUNK, f.size)).arrayBuffer());
+            if (s.length) samples.push(s);
+          }
+          this.core.resolveGzipAuto(base + i, samples);
+        }
+      }
+      await this.applyActions(this.take());
+      this.emitFiles();
+      this.log(`appended ${items.length} file(s)`);
+      return true;
+    } catch (e) {
+      this.log(`append failed: ${e}`);
+      this.events.step(String(e));
+      return false;
+    }
+  }
+
+  /** Live share: leave cleanly (BYE to the peer, session ends). */
+  endSession(): void {
+    if (!this.core) return;
+    try {
+      this.core.endSession();
+      void this.applyActions(this.take());
+    } catch (e) {
+      this.log(`end failed: ${e}`);
     }
   }
 
@@ -496,6 +576,7 @@ export class Jaunt {
       this.recs.map((r) => ({
         id: r.id,
         name: r.name,
+        path: r.path,
         size: r.size,
         progress: r.progress,
         wireBytes: r.wireBytes,
@@ -609,6 +690,26 @@ export class Jaunt {
         case 'receipt': {
           this.hook.receipts.push(a.receipt);
           this.log('receipt stored');
+          break;
+        }
+        case 'filesAdded': {
+          // live share: the peer appended files; create receiver records
+          const added = (a.files ?? []) as { id: number; name: string; path: string; size: number; chunks: number; chunk_size: number }[];
+          for (const f of added) {
+            if (this.recById(f.id)) continue;
+            this.recs.push({
+              id: f.id,
+              name: f.name,
+              path: f.path,
+              size: f.size,
+              chunks: f.chunks,
+              chunkSize: f.chunk_size,
+              progress: 0,
+              wireBytes: 0,
+            });
+          }
+          this.emitFiles();
+          this.log(`peer appended ${added.length} file(s)`);
           break;
         }
         case 'text': {
@@ -839,24 +940,23 @@ export class Jaunt {
     this.emitFiles();
   }
 
-  private async startSender(files: File[], opts: SendOptions): Promise<void> {
-    if (!files.length) return;
+  private async startSender(entries: (File | ShareEntry)[], opts: SendOptions): Promise<void> {
+    const items = entries.map(normalizeEntry);
+    if (!items.length) return;
     this.resetSession();
     this.setState('pairing');
     this.events.step('hashing files…');
-    this.log(`sending ${files.length} file(s)`);
+    this.log(`sending ${items.length} file(s)`);
     this.privatePairing = !!opts.privatePairing;
     this.channelCount = Math.max(1, Math.min(4, opts.channels ?? 1));
     const words = Math.min(12, Math.max(4, opts.words ?? 6));
-    const gzipMode = opts.gzip ?? 'auto';
+    this.gzipMode = opts.gzip ?? 'auto';
+    const gzipMode = this.gzipMode;
     this.lastIce = opts.ice ?? this.getIce();
 
     const specs: { name: string; path: string; size: number; sha256: string; gzip: boolean }[] = [];
-    for (const f of files) {
-      const rel = f.webkitRelativePath ?? '';
-      const parts = rel.split('/').filter(Boolean);
-      parts.pop(); // last component is the name itself
-      specs.push({ name: f.name, path: parts.join('/'), size: f.size, sha256: await this.sha256Hex(f), gzip: gzipMode === 'on' });
+    for (const { file, path } of items) {
+      specs.push({ name: file.name, path, size: file.size, sha256: await this.sha256Hex(file), gzip: gzipMode === 'on' });
     }
 
     this.events.step('gathering ICE candidates…');
@@ -867,10 +967,10 @@ export class Jaunt {
     this.hook.sid = started.sid;
     if (E2E) this.hook.passphrase = this.passphrase;
     this.hook.blob1 = started.blob1;
-    this.core.setFiles(JSON.stringify(specs));
+    this.core.setFilesLive(JSON.stringify(specs), opts.live === true);
     if (gzipMode === 'auto') {
-      for (let i = 0; i < files.length; i++) {
-        const f = files[i];
+      for (let i = 0; i < items.length; i++) {
+        const f = items[i].file;
         const samples: Uint8Array[] = [];
         for (let c = 0; c < 4; c++) {
           const s = new Uint8Array(await f.slice(c * CHUNK, Math.min((c + 1) * CHUNK, f.size)).arrayBuffer());
@@ -892,7 +992,7 @@ export class Jaunt {
         chunkSize: CHUNK,
         progress: 0,
         wireBytes: 0,
-        source: files[i],
+        source: items[i].file,
       }),
     );
     this.manifestLoaded = true;
@@ -1175,4 +1275,12 @@ export class Jaunt {
     this.events.checksum(sum);
     this.log(`verification checksum: ${sum} — compare on both screens`);
   }
+}
+
+/** File or {file, path} entry to its (file, folder-path) pair. */
+function normalizeEntry(e: File | ShareEntry): { file: File; path: string } {
+  if ('file' in e) return { file: e.file, path: e.path.replace(/^\/+|\/+$/g, '') };
+  const parts = (e.webkitRelativePath ?? '').split('/').filter(Boolean);
+  parts.pop(); // last component is the name itself
+  return { file: e, path: parts.join('/') };
 }

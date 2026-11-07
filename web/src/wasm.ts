@@ -82,6 +82,18 @@ export class FjCore {
   setFiles(filesJson: string): void {
     this.raw.set_files(filesJson);
   }
+  setFilesLive(filesJson: string, live: boolean): void {
+    this.raw.set_files_live(filesJson, live);
+  }
+  appendFiles(filesJson: string): void {
+    this.raw.append_files(filesJson);
+  }
+  endSession(): void {
+    this.raw.end_session();
+  }
+  isLive(): boolean {
+    return this.raw.is_live();
+  }
   resolveGzipAuto(file: number, samples: Uint8Array[]): boolean {
     return this.raw.resolve_gzip_auto(file, samples);
   }

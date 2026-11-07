@@ -20,6 +20,7 @@ export type {
   JauntState,
   SendOptions,
   SenderStartResult,
+  ShareEntry,
 } from './engine';
 export { doctorProbe } from './transport';
 export type { DoctorResult, IceConfig, PathInfo } from './transport';

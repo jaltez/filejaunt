@@ -26,6 +26,10 @@ declare module 'fj-wasm' {
     resume_initiator(passphrase: string, offer_sdp: string): string;
     resume_responder(blob1: string, passphrase: string, answer_sdp: string): string;
     set_files(files_json: string): void;
+    set_files_live(files_json: string, live: boolean): void;
+    append_files(files_json: string): void;
+    end_session(): void;
+    is_live(): boolean;
     resolve_gzip_auto(file: number, samples: Uint8Array[]): boolean;
     on_channel_open(): void;
     on_frame(bytes: Uint8Array): void;
@@ -52,7 +56,7 @@ declare module 'fj-wasm' {
 
   /** JSON action shapes returned by take_actions(). */
   export interface FjActionJson {
-    t: 'send' | 'saveChunk' | 'saveState' | 'progress' | 'hashFeed' | 'fileDone' | 'receipt' | 'text' | 'done' | 'fail';
+    t: 'send' | 'saveChunk' | 'saveState' | 'progress' | 'hashFeed' | 'fileDone' | 'receipt' | 'text' | 'done' | 'fail' | 'filesAdded';
     bytes?: number[];
     file?: number;
     index?: number;

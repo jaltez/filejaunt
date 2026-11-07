@@ -46,6 +46,11 @@ pub struct Manifest {
     pub gzip: GzipPolicy,
     pub files: Vec<FileEntry>,
     pub total: u64,
+    /// Live share (docs/LIVE-SHARE.md): the session stays open after all
+    /// files settle, until BYE. Old peers ignore the field and old
+    /// behavior applies unless both sides advertised CAPS_LIVE.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Input for building a manifest entry (glue provides these; sha256 must be
@@ -123,7 +128,59 @@ pub fn build_manifest(
         },
         files,
         total,
+        live: false,
     })
+}
+
+/// Build one manifest entry for a live-share APPEND: same rules as
+/// `build_manifest`, with an explicit (already assigned) id.
+pub fn build_entry(id: u16, s: &FileSpec, chunk_size: u32) -> Result<FileEntry> {
+    if chunk_size != CHUNK_SIZE_DEFAULT && chunk_size != CHUNK_SIZE_LARGE {
+        return err(
+            ErrorCode::PathRejected,
+            format!("unsupported chunk_size {chunk_size}"),
+        );
+    }
+    validate_name(&s.name)?;
+    validate_path(&s.path)?;
+    validate_sha256(&s.sha256)?;
+    let chunks = chunks_for(s.size, chunk_size);
+    if chunks > u32::MAX as u64 {
+        return err(ErrorCode::PathRejected, "file too large for chunk indexing");
+    }
+    Ok(FileEntry {
+        id,
+        name: s.name.clone(),
+        path: s.path.clone(),
+        size: s.size,
+        chunks,
+        chunk_size,
+        sha256: s.sha256.to_lowercase(),
+    })
+}
+
+/// Validate one appended entry in isolation (structure, sizes, hash).
+pub fn validate_entry(e: &FileEntry) -> Result<()> {
+    validate_name(&e.name)?;
+    validate_path(&e.path)?;
+    validate_sha256(&e.sha256)?;
+    if e.chunk_size != CHUNK_SIZE_DEFAULT && e.chunk_size != CHUNK_SIZE_LARGE {
+        return err(
+            ErrorCode::PathRejected,
+            format!("bad chunk_size {}", e.chunk_size),
+        );
+    }
+    if e.chunks > u32::MAX as u64 {
+        return err(ErrorCode::PathRejected, "chunk count exceeds u32");
+    }
+    let expect = chunks_for(e.size, e.chunk_size);
+    if e.chunks != expect {
+        return err(
+            ErrorCode::PathRejected,
+            format!("file {} chunks {} != expected {expect}", e.id, e.chunks),
+        );
+    }
+    Ok(())
 }
 
 impl Manifest {

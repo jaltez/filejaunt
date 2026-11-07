@@ -29,6 +29,7 @@ fn all_frames() -> Vec<Frame> {
             role: 0,
             version: 1,
             fp: [7u8; 32],
+            caps: 0,
         },
         Frame::Manifest(sample_manifest()),
         Frame::ChunkReq {
@@ -151,6 +152,7 @@ fn malformed_json_payloads() {
             role: 0,
             version: 1,
             fp: [0; 32],
+            caps: 0,
         },
         Frame::ChunkReq {
             file: 0,

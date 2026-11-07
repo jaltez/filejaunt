@@ -18,9 +18,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::bitmap::{Bitmap, BitmapJson};
 use crate::crypto::{self, Dir, Key32};
 use crate::envelope::{Envelope1, Envelope2, Envelope3, Envelope4, PairingMode, validate_env1};
-use crate::error::{ErrorCode, Result, err};
-use crate::frame::Frame;
-use crate::manifest::{FileSpec, Manifest, build_manifest};
+use crate::error::{Error, ErrorCode, Result, err};
+use crate::frame::{CAPS_APPEND, CAPS_LIVE, Frame};
+use crate::manifest::{FileSpec, Manifest, build_entry, build_manifest, validate_entry};
 use crate::pake::{AttemptLimiter, PakeSide};
 use crate::receipt::{Receipt, ReceiptMsg};
 use crate::{
@@ -100,6 +100,8 @@ pub enum Action {
         verified: bool,
     },
     EmitText(String),
+    /// Live share: the peer appended files; entries carry name/path/size.
+    FilesAdded(Vec<crate::manifest::FileEntry>),
     Receipt(Receipt),
     SessionDone,
     Fail {
@@ -227,8 +229,33 @@ pub struct Session {
     paused: BTreeSet<u16>,
     cancelled: BTreeSet<u16>,
     resumed: bool,
+    /// Capability bits the peer advertised in HELO (0 for old peers).
+    peer_caps: u8,
     chunks_since_save: u64,
     hashers: std::collections::HashMap<u16, (sha2::Sha256, u64)>,
+}
+
+/// Fresh per-file state for a manifest entry (live-share appends reuse it).
+fn file_state(f: &crate::manifest::FileEntry) -> FileState {
+    FileState {
+        id: f.id,
+        sent: Bitmap::new(f.chunks),
+        acked: Bitmap::new(f.chunks),
+        covered: Bitmap::new(f.chunks),
+        covered_ones: 0,
+        cursor: 0,
+        have: Bitmap::new(f.chunks),
+        have_ones: 0,
+        done_claimed: false,
+        done_sent: false,
+        file_done: false,
+        verified: false,
+        receipt_sent: false,
+        bytes_moved: 0,
+        wire_bytes: 0,
+        dups: 0,
+        gzip: None,
+    }
 }
 
 fn one_channel() -> usize {
@@ -502,43 +529,32 @@ impl Session {
 
     /// Initiator: set the files to transfer (call before channel open).
     pub fn set_files(&mut self, specs: &[FileSpec]) -> Result<()> {
+        self.set_files_live(specs, false)
+    }
+
+    /// Like `set_files`, but marks the session as a live share: with a
+    /// CAPS_LIVE peer the session stays open after all files settle.
+    pub fn set_files_live(&mut self, specs: &[FileSpec], live: bool) -> Result<()> {
         self.ensure_role(Role::Initiator)?;
-        let manifest = build_manifest(&self.sid, self.epoch, specs, self.chunk_size)?;
+        let mut manifest = build_manifest(&self.sid, self.epoch, specs, self.chunk_size)?;
+        manifest.live = live;
         self.set_manifest(manifest)?;
         // carry the per-file compression decision into the send state
+        self.carry_gzip(specs);
+        Ok(())
+    }
+
+    fn carry_gzip(&mut self, specs: &[FileSpec]) {
         for (i, spec) in specs.iter().enumerate() {
             if let Some(f) = self.files.get_mut(i) {
                 f.gzip = Some(spec.gzip);
             }
         }
-        Ok(())
     }
 
     pub(crate) fn set_manifest(&mut self, manifest: Manifest) -> Result<()> {
         manifest.validate()?;
-        self.files = manifest
-            .files
-            .iter()
-            .map(|f| FileState {
-                id: f.id,
-                sent: Bitmap::new(f.chunks),
-                acked: Bitmap::new(f.chunks),
-                covered: Bitmap::new(f.chunks),
-                covered_ones: 0,
-                cursor: 0,
-                have: Bitmap::new(f.chunks),
-                have_ones: 0,
-                done_claimed: false,
-                done_sent: false,
-                file_done: false,
-                verified: false,
-                receipt_sent: false,
-                bytes_moved: 0,
-                wire_bytes: 0,
-                dups: 0,
-                gzip: None,
-            })
-            .collect();
+        self.files = manifest.files.iter().map(file_state).collect();
         self.manifest = Some(manifest);
         Ok(())
     }
@@ -584,6 +600,7 @@ impl Session {
             role: role_byte,
             version: PROTOCOL_VERSION,
             fp,
+            caps: CAPS_LIVE | CAPS_APPEND,
         })
     }
 
@@ -652,17 +669,28 @@ impl Session {
     fn handle_frame(&mut self, frame: Frame) -> Result<Vec<Action>> {
         // First frame from the peer must be HELO.
         if !self.helo_received {
-            let Frame::Hello { role, version, fp } = frame else {
+            let Frame::Hello {
+                role,
+                version,
+                fp,
+                caps,
+            } = frame
+            else {
                 self.phase = Phase::Failed;
                 return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "first frame was not HELO"));
             };
-            return self.on_helo(role, version, fp);
+            return self.on_helo(role, version, fp, caps);
         }
         match frame {
-            Frame::Hello { role, version, fp } => {
+            Frame::Hello {
+                role,
+                version,
+                fp,
+                caps,
+            } => {
                 // duplicate HELOs happen when the peer announces on every
                 // channel; the fingerprint must still match
-                self.on_helo(role, version, fp)
+                self.on_helo(role, version, fp, caps)
             }
             Frame::Manifest(m) => self.on_manifest(m),
             Frame::ChunkReq { .. } => Ok(vec![]), // push model; BITMAP covers resume
@@ -689,10 +717,12 @@ impl Session {
                 Ok(vec![Action::Fail { code, msg }])
             }
             Frame::Done { file } => self.on_done(file),
+            Frame::Bye => self.on_bye(),
+            Frame::Append(entries) => self.on_append(entries),
         }
     }
 
-    fn on_helo(&mut self, role: u8, version: u8, fp: [u8; 32]) -> Result<Vec<Action>> {
+    fn on_helo(&mut self, role: u8, version: u8, fp: [u8; 32], caps: u8) -> Result<Vec<Action>> {
         let expect_role = match self.role {
             Role::Initiator => 1u8,
             Role::Responder => 0u8,
@@ -703,6 +733,7 @@ impl Session {
             self.phase = Phase::Failed;
             return Ok(self.fail_pair(ErrorCode::SecHelloMismatch, "HELO fingerprint mismatch"));
         }
+        self.peer_caps = caps;
         self.helo_received = true;
         self.phase = Phase::Active;
         let mut actions = vec![Action::SaveState];
@@ -961,7 +992,7 @@ impl Session {
         ];
         actions.push(self.send(Frame::Receipt(msg)));
         actions.push(Action::SaveState);
-        if self.all_files_settled_receiver() {
+        if self.all_files_settled_receiver() && !self.live_session() {
             self.phase = Phase::Done;
             actions.push(Action::SessionDone);
         }
@@ -1244,7 +1275,7 @@ impl Session {
             },
             Action::SaveState,
         ];
-        if self.all_files_settled_initiator() {
+        if self.all_files_settled_initiator() && !self.live_session() {
             self.phase = Phase::Done;
             actions.push(Action::SessionDone);
         }
@@ -1284,7 +1315,9 @@ impl Session {
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "CANCEL for unknown file"));
         }
         self.cancelled.insert(file);
-        if self.all_files_settled_receiver() || self.all_files_settled_initiator() {
+        if (self.all_files_settled_receiver() || self.all_files_settled_initiator())
+            && !self.live_session()
+        {
             self.phase = Phase::Done;
             return Ok(vec![Action::SessionDone]);
         }
@@ -1366,7 +1399,10 @@ impl Session {
             self.cancelled.insert(file);
         }
         let mut actions = vec![self.send(Frame::Cancel { file })];
-        if self.all_files_settled_initiator() || self.all_files_settled_receiver() {
+        let settled = self.all_files_settled_initiator() || self.all_files_settled_receiver();
+        // In a live share, cancelling one file keeps the session open;
+        // cancelling everything is intent to leave.
+        if settled && (file == FILE_ALL || !self.live_session()) {
             self.phase = Phase::Done;
             actions.push(Action::SessionDone);
         }
@@ -1382,6 +1418,174 @@ impl Session {
             return err(ErrorCode::ProtoMalformed, "session not active");
         }
         Ok(self.encrypt_frame(&Frame::Text(text.to_string())))
+    }
+
+    // ------------------------------------------------------------------
+    // Live share (docs/LIVE-SHARE.md)
+    // ------------------------------------------------------------------
+
+    /// True when both sides agreed to keep the session open past the last
+    /// settled file: the initiator marked the manifest live and the peer
+    /// advertised CAPS_LIVE. Old peers collapse this to false.
+    fn live_session(&self) -> bool {
+        self.manifest.as_ref().is_some_and(|m| m.live) && self.peer_caps & CAPS_LIVE != 0
+    }
+
+    /// Leave a live share cleanly: sends BYE, ends the session.
+    pub fn end_session(&mut self) -> Result<Vec<Action>> {
+        if self.phase != Phase::Active || !self.live_session() {
+            return err(
+                ErrorCode::ProtoMalformed,
+                "end_session: not an active live session",
+            );
+        }
+        let mut actions = vec![self.send(Frame::Bye)];
+        self.phase = Phase::Done;
+        actions.push(Action::SessionDone);
+        Ok(actions)
+    }
+
+    fn on_bye(&mut self) -> Result<Vec<Action>> {
+        if !self.live_session() || self.phase != Phase::Active {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "BYE outside a live session"));
+        }
+        self.phase = Phase::Done;
+        Ok(vec![Action::SessionDone])
+    }
+
+    /// Add files to a live session. Initiator only; requires the peer to
+    /// have advertised CAPS_APPEND. New ids continue the manifest.
+    pub fn append_files(&mut self, specs: &[FileSpec]) -> Result<Vec<Action>> {
+        self.ensure_role(Role::Initiator)?;
+        if self.phase != Phase::Active {
+            return err(
+                ErrorCode::ProtoMalformed,
+                "append_files: session not active",
+            );
+        }
+        if self.peer_caps & CAPS_APPEND == 0 {
+            return err(ErrorCode::ProtoMalformed, "peer lacks append capability");
+        }
+        if specs.is_empty() {
+            return err(ErrorCode::PathRejected, "append_files: no files");
+        }
+        let base = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorCode::PathRejected, "append before set_files"))?
+            .files
+            .len() as u16;
+        let mut entries = Vec::with_capacity(specs.len());
+        for (i, s) in specs.iter().enumerate() {
+            let id = base
+                .checked_add(i as u16)
+                .ok_or_else(|| Error::new(ErrorCode::PathRejected, "file id overflows u16"))?;
+            entries.push(build_entry(id, s, self.chunk_size)?);
+        }
+        // Re-validate the whole extended manifest (ids, limits, totals).
+        let mut extended = self.manifest.clone().expect("manifest checked above");
+        extended
+            .total
+            .checked_add(entries.iter().map(|e| e.size).sum::<u64>())
+            .ok_or_else(|| Error::new(ErrorCode::PathRejected, "manifest total overflow"))?;
+        extended.total = extended
+            .total
+            .saturating_add(entries.iter().map(|e| e.size).sum::<u64>());
+        extended.files.extend(entries.iter().cloned());
+        extended.validate()?;
+        // Empty appended files are immediately DONE, like at session start.
+        let mut actions = vec![self.send(Frame::Append(entries.clone()))];
+        for e in &entries {
+            self.files.push(file_state(e));
+            if e.chunks == 0 {
+                if let Some(f) = self.files.last_mut() {
+                    f.done_sent = true;
+                }
+                actions.push(self.send(Frame::Done { file: e.id }));
+            }
+        }
+        self.manifest = Some(extended);
+        self.carry_appended_gzip(base, specs);
+        actions.push(Action::SaveState);
+        Ok(actions)
+    }
+
+    fn carry_appended_gzip(&mut self, base: u16, specs: &[FileSpec]) {
+        for (i, spec) in specs.iter().enumerate() {
+            if let Some(id) = base.checked_add(i as u16)
+                && let Some(f) = self.files.iter_mut().find(|f| f.id == id)
+            {
+                f.gzip = Some(spec.gzip);
+            }
+        }
+    }
+
+    fn on_append(&mut self, entries: Vec<crate::manifest::FileEntry>) -> Result<Vec<Action>> {
+        if self.role == Role::Initiator {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "initiator must not receive APPEND",
+            ));
+        }
+        if self.phase != Phase::Active {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "APPEND outside an active session",
+            ));
+        }
+        if self.peer_caps & CAPS_APPEND == 0 {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "APPEND from peer without capability",
+            ));
+        }
+        let Some(m) = self.manifest.as_ref() else {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "APPEND before MANIFEST"));
+        };
+        if entries.is_empty() {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "empty APPEND"));
+        }
+        let base = m.files.len() as u16;
+        for (i, e) in entries.iter().enumerate() {
+            let expect = base
+                .checked_add(i as u16)
+                .ok_or_else(|| Error::new(ErrorCode::ProtoMalformed, "file id overflows u16"))?;
+            if e.id != expect {
+                self.phase = Phase::Failed;
+                return Ok(self.fail_pair(
+                    ErrorCode::ProtoMalformed,
+                    &format!("APPEND id {} out of sequence (expected {expect})", e.id),
+                ));
+            }
+            if e.chunk_size != self.chunk_size {
+                self.phase = Phase::Failed;
+                return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "APPEND mixes chunk sizes"));
+            }
+            if let Err(e) = validate_entry(e) {
+                self.phase = Phase::Failed;
+                return Ok(self.fail_pair(e.code(), e.msg()));
+            }
+        }
+        let mut extended = m.clone();
+        extended.total = extended
+            .total
+            .saturating_add(entries.iter().map(|e| e.size).sum::<u64>());
+        extended.files.extend(entries.iter().cloned());
+        if let Err(e) = extended.validate() {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(e.code(), e.msg()));
+        }
+        for e in &entries {
+            self.files.push(file_state(e));
+        }
+        self.manifest = Some(extended);
+        Ok(vec![Action::FilesAdded(entries), Action::SaveState])
     }
 
     // ------------------------------------------------------------------
@@ -1491,6 +1695,7 @@ impl Session {
             paused: BTreeSet::new(),
             cancelled: BTreeSet::new(),
             resumed: false,
+            peer_caps: 0,
             chunks_since_save: 0,
             hashers: Default::default(),
         })
@@ -1732,6 +1937,7 @@ impl Session {
             paused: snap.paused.into_iter().collect(),
             cancelled: snap.cancelled.into_iter().collect(),
             resumed: snap.resumed,
+            peer_caps: 0,
             chunks_since_save: 0,
             hashers: Default::default(),
         };
@@ -1859,6 +2065,11 @@ impl Session {
                 .unwrap_or(0),
             f.wire_bytes,
         ))
+    }
+
+    /// True while this is a live share that both sides keep open.
+    pub fn is_live(&self) -> bool {
+        self.live_session()
     }
 
     pub fn dup_count(&self, file: u16) -> u64 {

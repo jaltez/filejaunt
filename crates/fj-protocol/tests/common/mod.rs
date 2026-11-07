@@ -43,6 +43,7 @@ pub enum Event {
     },
     Receipt,
     Text(String),
+    FilesAdded(usize),
     SessionDone,
     Fail {
         code: ErrorCode,
@@ -66,6 +67,11 @@ impl Loop {
     /// Build a paired, channel-open pair of sessions with the given file
     /// contents (ids 0..n). Gzip off for determinism.
     pub fn new(files: &[(String, Vec<u8>)], private3: bool) -> Loop {
+        Loop::new_mode(files, private3, false)
+    }
+
+    /// Like `new`, but marks the session as a live share when `live`.
+    pub fn new_mode(files: &[(String, Vec<u8>)], private3: bool, live: bool) -> Loop {
         let mut limiter = fj_protocol::pake::AttemptLimiter::new();
         let (mut ini, passphrase, blob1) = Session::initiator_new(SessionOpts {
             words: 6,
@@ -110,7 +116,11 @@ impl Loop {
                 gzip: false,
             })
             .collect();
-        ini.set_files(&specs).expect("set_files");
+        if live {
+            ini.set_files_live(&specs, true).expect("set_files_live");
+        } else {
+            ini.set_files(&specs).expect("set_files");
+        }
         let mut source = HashMap::new();
         for (i, (_, data)) in files.iter().enumerate() {
             source.insert(i as u16, data.clone());
@@ -179,6 +189,9 @@ impl Loop {
                     self.events(role, Event::Receipt);
                 }
                 Action::SessionDone => self.events(role, Event::SessionDone),
+                Action::FilesAdded(files) => {
+                    self.events(role, Event::FilesAdded(files.len()));
+                }
                 Action::Fail { code, msg } => self.events(role, Event::Fail { code, msg }),
             }
         }
@@ -321,6 +334,11 @@ impl Loop {
                 self.apply(Role::Initiator, actions);
             }
         }
+    }
+
+    /// Register the byte source for a live-share appended file id.
+    pub fn add_file_source(&mut self, id: u16, data: Vec<u8>) {
+        self.source.insert(id, data);
     }
 
     pub fn received_file(&self, file: u16) -> Vec<u8> {

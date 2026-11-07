@@ -1228,6 +1228,7 @@ impl Engine {
             | Action::Receipt(_)
             | Action::SaveState
             | Action::EmitText(_)
+            | Action::FilesAdded(_)
             | Action::Fail { .. }
             | Action::SessionDone => self.route_notice(rx, a).await,
         }
@@ -1293,6 +1294,17 @@ impl Engine {
             }
             Action::EmitText(t) => {
                 self.out.stderr_line(&format!("text: {}", ui::sanitize(&t)));
+                Ok(false)
+            }
+            Action::FilesAdded(files) => {
+                match self.out.mode {
+                    Mode::Json => self.out.json(serde_json::json!({
+                        "type": "filesAdded", "count": files.len(),
+                    })),
+                    Mode::Human => self
+                        .out
+                        .stderr_line(&format!("{} file(s) added to the share", files.len())),
+                }
                 Ok(false)
             }
             Action::SessionDone => Ok(true),

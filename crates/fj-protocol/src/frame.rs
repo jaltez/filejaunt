@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, err};
 use crate::frame::FrameType::*;
-use crate::manifest::Manifest;
+use crate::manifest::{FileEntry, Manifest};
 use crate::receipt::ReceiptMsg;
 use crate::{FRAME_HEADER_LEN, MAX_TEXT_BYTES, PROTOCOL_VERSION};
 
@@ -36,6 +36,11 @@ pub enum FrameType {
     Text = 0x0A,
     Error = 0x0B,
     Done = 0x0C,
+    /// Live-share extension (docs/LIVE-SHARE.md): only between peers that
+    /// advertised CAPS_LIVE in HELO.
+    Bye = 0x0D,
+    /// Live-share extension: only between peers that advertised CAPS_APPEND.
+    Append = 0x0E,
 }
 
 impl FrameType {
@@ -53,20 +58,29 @@ impl FrameType {
             0x0A => Text,
             0x0B => Error,
             0x0C => Done,
+            0x0D => Bye,
+            0x0E => Append,
             _ => return None,
         })
     }
 }
 
+/// Capability bits carried in HELO's optional `c` field (absent = 0).
+/// Gates every live-share frames so peers on the old protocol never see one.
+pub const CAPS_LIVE: u8 = 0x01;
+pub const CAPS_APPEND: u8 = 0x02;
+
 /// Decoded frame. Payload-level validation is done here where cheap
 /// (structure, sizes); semantic validation happens in `session`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
-    /// HELO: first frame from each side (sent encrypted).
+    /// HELO: first frame from each side (sent encrypted). `caps` carries
+    /// the live-share capability bits; 0 when talking to an old peer.
     Hello {
         role: u8,
         version: u8,
         fp: [u8; 32],
+        caps: u8,
     },
     Manifest(Manifest),
     ChunkReq {
@@ -102,6 +116,12 @@ pub enum Frame {
     Done {
         file: u16,
     },
+    /// Live share: the sender of BYE is leaving; the session ends cleanly.
+    /// Only sent between CAPS_LIVE peers.
+    Bye,
+    /// Live share: new files added to the manifest (ids continue the
+    /// existing sequence). Only sent between CAPS_APPEND peers.
+    Append(Vec<FileEntry>),
 }
 
 impl Frame {
@@ -119,6 +139,8 @@ impl Frame {
             Frame::Text(_) => Text,
             Frame::Error { .. } => Error,
             Frame::Done { .. } => Done,
+            Frame::Bye => Bye,
+            Frame::Append(_) => Append,
         }
     }
 
@@ -165,8 +187,13 @@ impl Frame {
 
     fn encode_payload(&self, out: &mut Vec<u8>) {
         match self {
-            Frame::Hello { role, version, fp } => {
-                let j = serde_json::json!({"r": role, "v": version, "fp": b64(fp)});
+            Frame::Hello {
+                role,
+                version,
+                fp,
+                caps,
+            } => {
+                let j = serde_json::json!({"r": role, "v": version, "fp": b64(fp), "c": caps});
                 out.extend_from_slice(j.to_string().as_bytes());
             }
             Frame::Manifest(m) => {
@@ -212,6 +239,11 @@ impl Frame {
                 let j = serde_json::json!({"code": code.as_str(), "msg": msg});
                 out.extend_from_slice(j.to_string().as_bytes());
             }
+            Frame::Bye => {}
+            Frame::Append(entries) => {
+                let j = serde_json::json!({"files": entries});
+                out.extend_from_slice(j.to_string().as_bytes());
+            }
         }
     }
 
@@ -254,6 +286,9 @@ impl Frame {
                     r: u8,
                     v: u8,
                     fp: String,
+                    /// Capability bits; absent (old peer) decodes as 0.
+                    #[serde(default)]
+                    c: u8,
                 }
                 let h: H = decode_json(payload)?;
                 let fp = b64_decode(&h.fp, Some(32))?;
@@ -266,6 +301,7 @@ impl Frame {
                     role: h.r,
                     version: h.v,
                     fp: f,
+                    caps: h.c,
                 })
             }
             Manifest => {
@@ -373,6 +409,20 @@ impl Frame {
                     )
                 })?;
                 Ok(Frame::Error { code, msg: e.msg })
+            }
+            Bye => {
+                if !payload.is_empty() {
+                    return err(ErrorCode::ProtoMalformed, "BYE must be empty");
+                }
+                Ok(Frame::Bye)
+            }
+            Append => {
+                #[derive(Deserialize)]
+                struct A {
+                    files: Vec<FileEntry>,
+                }
+                let a: A = decode_json(payload)?;
+                Ok(Frame::Append(a.files))
             }
         }
     }

@@ -444,3 +444,113 @@ fn hash_mismatch_detected() {
         "hash mismatch must fail the session"
     );
 }
+
+#[test]
+fn live_session_stays_open_text_and_bye() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("live.bin".into(), data)], false, true);
+    l.pump();
+
+    // file verified, but nobody closed the session
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 0,
+        verified: true
+    }));
+    assert!(!l.events_ini.contains(&Event::SessionDone));
+    assert!(!l.events_rsp.contains(&Event::SessionDone));
+    assert!(!l.ini.is_done() && !l.rsp.is_done());
+
+    // chat works after the last receipt, both directions
+    let w = l.ini.send_text("after the last byte").unwrap();
+    let acts = l.rsp.on_frame(&w).unwrap();
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, Action::EmitText(t) if t == "after the last byte"))
+    );
+    let w = l.rsp.send_text("still here").unwrap();
+    let acts = l.ini.on_frame(&w).unwrap();
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, Action::EmitText(t) if t == "still here"))
+    );
+
+    // the receiver leaves: BYE ends both sides cleanly
+    let acts = l.rsp.end_session().unwrap();
+    l.apply(Role::Responder, acts);
+    l.pump();
+    assert!(l.rsp.is_done());
+    assert!(l.ini.is_done());
+    assert!(l.events_ini.contains(&Event::SessionDone));
+}
+
+#[test]
+fn live_session_append_transfers_and_verifies() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("first.bin".into(), data)], false, true);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 0,
+        verified: true
+    }));
+
+    // append a file inside a subfolder plus an empty one
+    let extra = b"appended bytes".to_vec();
+    let empty: Vec<u8> = vec![];
+    let specs = vec![
+        fj_protocol::manifest::FileSpec {
+            name: "late.bin".into(),
+            path: "extra".into(),
+            size: extra.len() as u64,
+            sha256: sha256_hex(&extra),
+            gzip: false,
+        },
+        fj_protocol::manifest::FileSpec {
+            name: "late-empty.dat".into(),
+            path: "extra".into(),
+            size: 0,
+            sha256: sha256_hex(&empty),
+            gzip: false,
+        },
+    ];
+    l.add_file_source(1, extra.clone());
+    l.add_file_source(2, empty.clone());
+    let acts = l.ini.append_files(&specs).expect("append");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+
+    assert!(l.events_rsp.contains(&Event::FilesAdded(2)));
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 1,
+        verified: true
+    }));
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 2,
+        verified: true
+    }));
+    assert_eq!(l.received_file(1), extra);
+    // still open after everything settled
+    assert!(!l.ini.is_done() && !l.rsp.is_done());
+
+    let acts = l.ini.end_session().unwrap();
+    l.apply(Role::Initiator, acts);
+    l.pump();
+    assert!(l.ini.is_done() && l.rsp.is_done());
+}
+
+#[test]
+fn append_rejected_without_live_manifest() {
+    // a plain (non-live) session must refuse appends
+    let data = file_1mib();
+    let mut l = Loop::new(&[("plain.bin".into(), data)], false);
+    l.pump();
+    assert!(l.ini.is_done(), "non-live session auto-closes as before");
+    let extra = b"too late".to_vec();
+    let specs = vec![fj_protocol::manifest::FileSpec {
+        name: "late.bin".into(),
+        path: String::new(),
+        size: extra.len() as u64,
+        sha256: sha256_hex(&extra),
+        gzip: false,
+    }];
+    assert!(l.ini.append_files(&specs).is_err());
+}

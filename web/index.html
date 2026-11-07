@@ -41,6 +41,7 @@ details{margin:1rem 0}
   <div>
     <label>words <input id="words" type="number" min="4" max="12" value="6"></label>
     <label><input id="private3" type="checkbox"> private (4-paste pairing, no SDP in clear)</label>
+    <label><input id="live" type="checkbox"> live share (chat and appends after transfer)</label>
   </div>
   <div>
     <label for="pass-in">passphrase (receiver):</label>
@@ -65,6 +66,10 @@ details{margin:1rem 0}
   <div>
     <input id="text-send" type="text" placeholder="text message" autocomplete="off">
     <button id="text-send-btn">Send text</button>
+  </div>
+  <div>
+    <input id="append-input" type="file" multiple webkitdirectory>
+    <button id="end-share">End share</button>
   </div>
   <div>
     <span>(each receiver pairs independently &mdash; open one tab per receiver)</span>
