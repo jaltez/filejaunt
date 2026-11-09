@@ -88,6 +88,9 @@ export class FjCore {
   appendFiles(filesJson: string): void {
     this.raw.append_files(filesJson);
   }
+  removeFile(file: number): void {
+    this.raw.remove_file(file);
+  }
   endSession(): void {
     this.raw.end_session();
   }

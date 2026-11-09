@@ -212,6 +212,7 @@ fn resume_after_interruption_epoch_bump() {
         size: data.len() as u64,
         sha256: sha256_hex(&data),
         gzip: false,
+        supersedes: None,
     }])
     .unwrap();
     let (mut rsp, blob2) = Session::responder_join(&blob1, &pass, ANSWER, &mut limiter).unwrap();
@@ -503,6 +504,7 @@ fn live_session_append_transfers_and_verifies() {
             size: extra.len() as u64,
             sha256: sha256_hex(&extra),
             gzip: false,
+            supersedes: None,
         },
         fj_protocol::manifest::FileSpec {
             name: "late-empty.dat".into(),
@@ -510,6 +512,7 @@ fn live_session_append_transfers_and_verifies() {
             size: 0,
             sha256: sha256_hex(&empty),
             gzip: false,
+            supersedes: None,
         },
     ];
     l.add_file_source(1, extra.clone());
@@ -551,6 +554,155 @@ fn append_rejected_without_live_manifest() {
         size: extra.len() as u64,
         sha256: sha256_hex(&extra),
         gzip: false,
+        supersedes: None,
     }];
     assert!(l.ini.append_files(&specs).is_err());
+}
+
+#[test]
+fn live_edit_supersedes_and_verifies() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("edit.bin".into(), data)], false, true);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 0,
+        verified: true
+    }));
+
+    // rewrite the same name/path with different bytes: new id supersedes 0
+    let updated = prand(0xED17, 200_000);
+    let specs = vec![fj_protocol::manifest::FileSpec {
+        name: "edit.bin".into(),
+        path: String::new(),
+        size: updated.len() as u64,
+        sha256: sha256_hex(&updated),
+        gzip: false,
+        supersedes: Some(0),
+    }];
+    l.add_file_source(1, updated.clone());
+    let acts = l.ini.append_files(&specs).expect("supersede append");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+
+    assert!(l.events_rsp.contains(&Event::FilesAdded(1)));
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 1,
+        verified: true
+    }));
+    assert_eq!(l.received_file(1), updated);
+    // supersede is internal retirement, not a REMOVE on the wire
+    assert!(!l.events_rsp.contains(&Event::FileRemoved(0)));
+    let ini_dbg: serde_json::Value = serde_json::from_str(&l.ini.debug_json()).unwrap();
+    let rsp_dbg: serde_json::Value = serde_json::from_str(&l.rsp.debug_json()).unwrap();
+    let retired = serde_json::Value::from(vec![0u16]);
+    assert_eq!(ini_dbg["retired"], retired, "sender retired the old id");
+    assert_eq!(rsp_dbg["retired"], retired, "receiver retired the old id");
+    // still open after everything settled
+    assert!(!l.ini.is_done() && !l.rsp.is_done());
+}
+
+#[test]
+fn remove_file_marks_receiver_and_stays_open() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("rm.bin".into(), data)], false, true);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 0,
+        verified: true
+    }));
+
+    let acts = l.ini.remove_file(0).expect("remove");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+
+    assert!(
+        l.events_rsp.contains(&Event::FileRemoved(0)),
+        "receiver sees the removal"
+    );
+    assert_eq!(
+        l.received_file(0).len(),
+        (1 << 20),
+        "receiver keeps the bytes"
+    );
+    assert!(
+        !l.ini.is_done() && !l.rsp.is_done(),
+        "live session stays open"
+    );
+
+    // idempotent, and the session still carries chat afterwards
+    assert!(l.ini.remove_file(0).expect("idempotent").is_empty());
+    let w = l.ini.send_text("after remove").unwrap();
+    let acts = l.rsp.on_frame(&w).unwrap();
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, Action::EmitText(t) if t == "after remove"))
+    );
+}
+
+#[test]
+fn supersede_rejects_bad_target() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("first.bin".into(), data)], false, true);
+    l.pump();
+
+    let other = b"other bytes".to_vec();
+    let spec = |name: &str, supersedes: Option<u16>| fj_protocol::manifest::FileSpec {
+        name: name.into(),
+        path: String::new(),
+        size: other.len() as u64,
+        sha256: sha256_hex(&other),
+        gzip: false,
+        supersedes,
+    };
+    assert!(
+        l.ini.append_files(&[spec("first.bin", Some(99))]).is_err(),
+        "unknown supersede target"
+    );
+    assert!(
+        l.ini.append_files(&[spec("renamed.bin", Some(0))]).is_err(),
+        "name/path mismatch"
+    );
+
+    // failed validations leave the session intact and send nothing
+    l.pump();
+    assert!(
+        !l.ini.is_failed(),
+        "validation errors do not fail the session"
+    );
+    assert!(!l.events_rsp.contains(&Event::FilesAdded(1)));
+    assert!(!l.ini.is_done() && !l.rsp.is_done());
+
+    // ids were not consumed: the valid edit lands as id 1
+    l.add_file_source(1, other.clone());
+    let acts = l
+        .ini
+        .append_files(&[spec("first.bin", Some(0))])
+        .expect("valid supersede");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+    assert_eq!(l.received_file(1), other);
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 1,
+        verified: true
+    }));
+}
+
+#[test]
+fn remove_without_sync_caps_fails() {
+    // non-live sessions auto-close: phase Done rejects remove_file
+    let data = file_1mib();
+    let mut l = Loop::new(&[("plain.bin".into(), data)], false);
+    l.pump();
+    assert!(l.ini.is_done());
+    assert!(
+        l.ini.remove_file(0).is_err(),
+        "remove_file requires an active session"
+    );
+
+    // live session: unknown ids are rejected without failing the session
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("live.bin".into(), data)], false, true);
+    l.pump();
+    assert!(l.ini.remove_file(99).is_err(), "unknown file id");
+    assert!(!l.ini.is_failed());
 }

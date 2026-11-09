@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -19,7 +20,7 @@ use crate::bitmap::{Bitmap, BitmapJson};
 use crate::crypto::{self, Dir, Key32};
 use crate::envelope::{Envelope1, Envelope2, Envelope3, Envelope4, PairingMode, validate_env1};
 use crate::error::{Error, ErrorCode, Result, err};
-use crate::frame::{CAPS_APPEND, CAPS_LIVE, Frame};
+use crate::frame::{CAPS_APPEND, CAPS_LIVE, CAPS_SYNC, Frame};
 use crate::manifest::{FileSpec, Manifest, build_entry, build_manifest, validate_entry};
 use crate::pake::{AttemptLimiter, PakeSide};
 use crate::receipt::{Receipt, ReceiptMsg};
@@ -102,6 +103,11 @@ pub enum Action {
     EmitText(String),
     /// Live share: the peer appended files; entries carry name/path/size.
     FilesAdded(Vec<crate::manifest::FileEntry>),
+    /// Live share (M4): the sender removed this file. The receiver keeps
+    /// whatever it already has and marks it as removed.
+    FileRemoved {
+        file: u16,
+    },
     Receipt(Receipt),
     SessionDone,
     Fail {
@@ -170,6 +176,9 @@ struct Snapshot {
     files: Vec<FileSnap>,
     paused: Vec<u16>,
     cancelled: Vec<u16>,
+    /// M4: files retired by REMOVE or superseded by a later append.
+    #[serde(default)]
+    retired: Vec<u16>,
 }
 
 /// Per-file live state shared by both roles (fields used per role).
@@ -228,6 +237,8 @@ pub struct Session {
     files: Vec<FileState>,
     paused: BTreeSet<u16>,
     cancelled: BTreeSet<u16>,
+    /// M4: ids retired by REMOVE or superseded; never sent, always settles.
+    retired: BTreeSet<u16>,
     resumed: bool,
     /// Capability bits the peer advertised in HELO (0 for old peers).
     peer_caps: u8,
@@ -600,7 +611,7 @@ impl Session {
             role: role_byte,
             version: PROTOCOL_VERSION,
             fp,
-            caps: CAPS_LIVE | CAPS_APPEND,
+            caps: CAPS_LIVE | CAPS_APPEND | CAPS_SYNC,
         })
     }
 
@@ -719,6 +730,7 @@ impl Session {
             Frame::Done { file } => self.on_done(file),
             Frame::Bye => self.on_bye(),
             Frame::Append(entries) => self.on_append(entries),
+            Frame::Remove { file } => self.on_remove(file),
         }
     }
 
@@ -1073,6 +1085,7 @@ impl Session {
             || f.file_done
             || self.paused.contains(&file)
             || self.cancelled.contains(&file)
+            || self.retired.contains(&file)
         {
             return None;
         }
@@ -1284,18 +1297,16 @@ impl Session {
 
     fn all_files_settled_initiator(&self) -> bool {
         !self.files.is_empty()
-            && self
-                .files
-                .iter()
-                .all(|f| f.file_done || self.cancelled.contains(&f.id))
+            && self.files.iter().all(|f| {
+                f.file_done || self.cancelled.contains(&f.id) || self.retired.contains(&f.id)
+            })
     }
 
     fn all_files_settled_receiver(&self) -> bool {
         !self.files.is_empty()
-            && self
-                .files
-                .iter()
-                .all(|f| f.file_done || self.cancelled.contains(&f.id))
+            && self.files.iter().all(|f| {
+                f.file_done || self.cancelled.contains(&f.id) || self.retired.contains(&f.id)
+            })
     }
 
     // ------------------------------------------------------------------
@@ -1365,6 +1376,7 @@ impl Session {
             "failed": self.is_failed(),
             "paused": self.paused.iter().copied().collect::<Vec<_>>(),
             "cancelled": self.cancelled.iter().copied().collect::<Vec<_>>(),
+            "retired": self.retired.iter().copied().collect::<Vec<_>>(),
             "files": files,
         })
         .to_string()
@@ -1477,10 +1489,48 @@ impl Session {
             .files
             .len() as u16;
         let mut entries = Vec::with_capacity(specs.len());
+        let mut retire: Vec<u16> = Vec::new();
         for (i, s) in specs.iter().enumerate() {
             let id = base
                 .checked_add(i as u16)
                 .ok_or_else(|| Error::new(ErrorCode::PathRejected, "file id overflows u16"))?;
+            if let Some(target) = s.supersedes {
+                if target == id {
+                    return err(
+                        ErrorCode::PathRejected,
+                        "append_files: supersedes own file id",
+                    );
+                }
+                let t = self
+                    .manifest
+                    .as_ref()
+                    .and_then(|m| m.file(target))
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::PathRejected,
+                            format!("append_files: supersedes unknown file {target}"),
+                        )
+                    })?;
+                if self.retired.contains(&target) {
+                    return err(
+                        ErrorCode::PathRejected,
+                        "append_files: supersedes a retired file",
+                    );
+                }
+                if self.cancelled.contains(&target) {
+                    return err(
+                        ErrorCode::PathRejected,
+                        "append_files: supersedes a cancelled file",
+                    );
+                }
+                if t.name != s.name || t.path != s.path {
+                    return err(
+                        ErrorCode::PathRejected,
+                        "append_files: supersedes name/path mismatch",
+                    );
+                }
+                retire.push(target);
+            }
             entries.push(build_entry(id, s, self.chunk_size)?);
         }
         // Re-validate the whole extended manifest (ids, limits, totals).
@@ -1506,6 +1556,7 @@ impl Session {
             }
         }
         self.manifest = Some(extended);
+        self.retired.extend(retire);
         self.carry_appended_gzip(base, specs);
         actions.push(Action::SaveState);
         Ok(actions)
@@ -1571,6 +1622,36 @@ impl Session {
                 self.phase = Phase::Failed;
                 return Ok(self.fail_pair(e.code(), e.msg()));
             }
+            if let Some(target) = e.supersedes {
+                let Some(t) = m.file(target) else {
+                    self.phase = Phase::Failed;
+                    return Ok(self.fail_pair(
+                        ErrorCode::ProtoMalformed,
+                        &format!("APPEND supersedes unknown file {target}"),
+                    ));
+                };
+                if self.retired.contains(&target) {
+                    self.phase = Phase::Failed;
+                    return Ok(self.fail_pair(
+                        ErrorCode::ProtoMalformed,
+                        "APPEND supersedes a retired file",
+                    ));
+                }
+                if self.cancelled.contains(&target) {
+                    self.phase = Phase::Failed;
+                    return Ok(self.fail_pair(
+                        ErrorCode::ProtoMalformed,
+                        "APPEND supersedes a cancelled file",
+                    ));
+                }
+                if t.name != e.name || t.path != e.path {
+                    self.phase = Phase::Failed;
+                    return Ok(self.fail_pair(
+                        ErrorCode::ProtoMalformed,
+                        "APPEND supersedes name/path mismatch",
+                    ));
+                }
+            }
         }
         let mut extended = m.clone();
         extended.total = extended
@@ -1582,10 +1663,70 @@ impl Session {
             return Ok(self.fail_pair(e.code(), e.msg()));
         }
         for e in &entries {
+            if let Some(target) = e.supersedes {
+                self.retired.insert(target);
+            }
             self.files.push(file_state(e));
         }
         self.manifest = Some(extended);
         Ok(vec![Action::FilesAdded(entries), Action::SaveState])
+    }
+
+    /// M4: initiator removes a file from the live share. The receiver keeps
+    /// whatever it already has and marks it as removed. Idempotent.
+    pub fn remove_file(&mut self, file: u16) -> Result<Vec<Action>> {
+        self.ensure_role(Role::Initiator)?;
+        if self.phase != Phase::Active {
+            return err(ErrorCode::ProtoMalformed, "remove_file: session not active");
+        }
+        if self.peer_caps & CAPS_SYNC == 0 || self.peer_caps & CAPS_APPEND == 0 {
+            return err(ErrorCode::ProtoMalformed, "peer lacks sync capability");
+        }
+        if self.manifest.as_ref().and_then(|m| m.file(file)).is_none() {
+            return err(
+                ErrorCode::PathRejected,
+                format!("remove_file: unknown file {file}"),
+            );
+        }
+        if !self.retired.insert(file) {
+            return Ok(vec![]);
+        }
+        Ok(vec![self.send(Frame::Remove { file }), Action::SaveState])
+    }
+
+    fn on_remove(&mut self, file: u16) -> Result<Vec<Action>> {
+        if self.role == Role::Initiator {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "initiator must not receive REMOVE",
+            ));
+        }
+        if self.phase != Phase::Active {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "REMOVE outside an active session",
+            ));
+        }
+        if self.peer_caps & CAPS_SYNC == 0 {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                "REMOVE from peer without capability",
+            ));
+        }
+        if self.manifest.as_ref().and_then(|m| m.file(file)).is_none() {
+            self.phase = Phase::Failed;
+            return Ok(self.fail_pair(
+                ErrorCode::ProtoMalformed,
+                &format!("REMOVE for unknown file {file}"),
+            ));
+        }
+        if !self.retired.insert(file) {
+            return Ok(vec![]);
+        }
+        Ok(vec![Action::FileRemoved { file }, Action::SaveState])
     }
 
     // ------------------------------------------------------------------
@@ -1694,6 +1835,7 @@ impl Session {
             files: vec![],
             paused: BTreeSet::new(),
             cancelled: BTreeSet::new(),
+            retired: BTreeSet::new(),
             resumed: false,
             peer_caps: 0,
             chunks_since_save: 0,
@@ -1888,6 +2030,7 @@ impl Session {
                 .collect(),
             paused: self.paused.iter().copied().collect(),
             cancelled: self.cancelled.iter().copied().collect(),
+            retired: self.retired.iter().copied().collect(),
         };
         serde_json::to_string(&snap).expect("snapshot serializes")
     }
@@ -1936,6 +2079,7 @@ impl Session {
             files: vec![],
             paused: snap.paused.into_iter().collect(),
             cancelled: snap.cancelled.into_iter().collect(),
+            retired: snap.retired.into_iter().collect(),
             resumed: snap.resumed,
             peer_caps: 0,
             chunks_since_save: 0,

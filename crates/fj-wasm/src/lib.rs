@@ -18,7 +18,8 @@ use fj_protocol::session::{Action, Role, Session, SessionOpts};
 /// `{t:"send",bytes}` | `{t:"saveChunk",file,index,data}` | `{t:"saveState"}`
 /// | `{t:"progress",file,done,total,wireBytes,resumed}` | `{t:"hashFeed",file}`
 /// | `{t:"fileDone",file,sha256,verified}` | `{t:"receipt",receipt}`
-/// | `{t:"text",text}` | `{t:"done"}` | `{t:"fail",code,msg}`
+/// | `{t:"text",text}` | `{t:"filesAdded",files}` | `{t:"fileRemoved",file}`
+/// | `{t:"done"}` | `{t:"fail",code,msg}`
 #[wasm_bindgen]
 pub struct FjCore {
     session: Option<Session>,
@@ -67,6 +68,7 @@ fn action_to_js(a: Action) -> JsValue {
         }),
         Action::EmitText(text) => serde_json::json!({"t": "text", "text": text}),
         Action::FilesAdded(files) => serde_json::json!({"t": "filesAdded", "files": files}),
+        Action::FileRemoved { file } => serde_json::json!({"t": "fileRemoved", "file": file}),
         Action::Receipt(r) => serde_json::json!({"t": "receipt", "receipt": r}),
         Action::SessionDone => serde_json::json!({"t": "done"}),
         Action::Fail { code, msg } => {
@@ -215,6 +217,16 @@ impl FjCore {
         let specs: Vec<fj_protocol::manifest::FileSpec> =
             serde_json::from_str(files_json).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let actions = self.with_session(|s| s.append_files(&specs))?;
+        for a in actions {
+            self.pending.push(action_to_js(a));
+        }
+        Ok(())
+    }
+
+    /// Live share (M4): the sender removed a file. The peer keeps what it
+    /// has and marks it as removed.
+    pub fn remove_file(&mut self, file: u16) -> Result<(), JsValue> {
+        let actions = self.with_session(|s| s.remove_file(file))?;
         for a in actions {
             self.pending.push(action_to_js(a));
         }
@@ -746,6 +758,7 @@ mod parity {
                     size: source.len() as u64,
                     sha256: sha256_hex(&source),
                     gzip: false,
+                    supersedes: None,
                 },
                 FileSpec {
                     name: "empty.dat".into(),
@@ -753,6 +766,7 @@ mod parity {
                     size: 0,
                     sha256: empty_sha,
                     gzip: false,
+                    supersedes: None,
                 },
             ])
             .unwrap();

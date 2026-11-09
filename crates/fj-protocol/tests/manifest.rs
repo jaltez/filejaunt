@@ -71,6 +71,7 @@ fn unicode_happy_paths() {
             size: 100,
             sha256: "c".repeat(64),
             gzip: false,
+            supersedes: None,
         }],
         16384,
     )
@@ -88,6 +89,7 @@ fn chunk_math_and_dup_ids() {
         size,
         sha256: "a".repeat(64),
         gzip: false,
+        supersedes: None,
     };
     // chunk counts: size 0 -> 0 chunks (valid empty file)
     let m = build_manifest(
@@ -134,6 +136,7 @@ fn max_files() {
             size: 1,
             sha256: "a".repeat(64),
             gzip: false,
+            supersedes: None,
         })
         .collect();
     let e = build_manifest(&[0u8; 16], 0, &specs, 16384).unwrap_err();
@@ -148,6 +151,7 @@ fn sha256_field() {
         size: 1,
         sha256: "XYZ".repeat(20), // uppercase rejected
         gzip: false,
+        supersedes: None,
     };
     assert!(build_manifest(&[0u8; 16], 0, &[spec], 16384).is_err());
 }

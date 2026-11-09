@@ -28,6 +28,7 @@ declare module 'fj-wasm' {
     set_files(files_json: string): void;
     set_files_live(files_json: string, live: boolean): void;
     append_files(files_json: string): void;
+    remove_file(file: number): void;
     end_session(): void;
     is_live(): boolean;
     resolve_gzip_auto(file: number, samples: Uint8Array[]): boolean;
@@ -56,7 +57,7 @@ declare module 'fj-wasm' {
 
   /** JSON action shapes returned by take_actions(). */
   export interface FjActionJson {
-    t: 'send' | 'saveChunk' | 'saveState' | 'progress' | 'hashFeed' | 'fileDone' | 'receipt' | 'text' | 'done' | 'fail' | 'filesAdded';
+    t: 'send' | 'saveChunk' | 'saveState' | 'progress' | 'hashFeed' | 'fileDone' | 'receipt' | 'text' | 'done' | 'fail' | 'filesAdded' | 'fileRemoved';
     bytes?: number[];
     file?: number;
     index?: number;

@@ -60,7 +60,10 @@ details{margin:1rem 0}
 <section id="send-panel" class="hide">
   <h2>Send</h2>
   <div>
-    <input id="file-input" type="file" multiple webkitdirectory>
+    <input id="file-input" type="file" multiple>
+    <input id="file-input-dir" type="file" multiple webkitdirectory>
+    <button id="watch-folder" class="hide">Watch a folder</button>
+    <button id="rescan" class="hide">Re-scan</button>
     <ul id="queue"></ul>
   </div>
   <div>

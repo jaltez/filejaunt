@@ -37,6 +37,8 @@ export interface FileView {
   sha256?: string;
   verified?: boolean;
   paused?: boolean;
+  /** Live share: the sender removed this file; the receiver keeps its copy. */
+  removed?: boolean;
   sinkLabel?: string;
 }
 
@@ -53,6 +55,9 @@ export interface JauntEvents {
   checksum(sum: string): void;
   blobOut(blob: string): void;
   files(files: FileView[]): void;
+  /** Live share: the peer appended files (entries carry `supersedes` when a
+   *  previously synced file was replaced). */
+  filesAdded?(entries: ManifestFileJson[]): void;
   text(text: string): void;
   path(info: PathInfo | null): void;
   download(name: string, blob: Blob): void;
@@ -99,6 +104,9 @@ export interface SendOptions {
 export interface ShareEntry {
   file: File;
   path: string;
+  /** Live edit: id of the sender-side record this file replaces (same
+   *  name+path). The core retires the old id and the receiver drops it. */
+  supersedes?: number;
 }
 
 export interface SenderStartResult {
@@ -122,6 +130,31 @@ interface FileRec {
   sink?: Sink;
   sinkLabel?: string;
   paused?: boolean;
+  /** Live share: removed on the sender (bytes are kept locally). */
+  removed?: boolean;
+}
+
+/** One manifest entry as JSON (mirrors the core's FileEntry). */
+export interface ManifestFileJson {
+  id: number;
+  name: string;
+  path: string;
+  size: number;
+  chunks: number;
+  chunk_size: number;
+  supersedes?: number;
+}
+
+/** A folder whose changes the sender mirrors into a live session. */
+interface WatchedRoot {
+  /** First path component ("photos"). */
+  name: string;
+  /** File System Access root (Chromium); absent for input-picked roots. */
+  handle?: FileSystemDirectoryHandle;
+  /** Set when the page must re-request read permission (lost on reload). */
+  needsGrant?: boolean;
+  /** Baseline snapshot: subpath (after the root) -> file metadata. */
+  files: Map<string, { file: File; mtime: number; size: number }>;
 }
 
 /** Mirrors the debug state exposed as `window.__fj` by the example app. */
@@ -302,6 +335,13 @@ export class Jaunt {
   private badgeTimer = 0;
   private lastIce: IceConfig = { stunUrls: [] };
   private readonly recs: FileRec[] = [];
+  /** Live folder sync (M4): watched roots and their polling loop. */
+  private watched: WatchedRoot[] = [];
+  private watchTimer: number | null = null;
+  private scanning = false;
+  private readonly onVisibility = (): void => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') void this.rescan();
+  };
 
   private constructor(opts: JauntOptions) {
     this.events = { ...NO_EVENTS, ...opts.events };
@@ -434,17 +474,30 @@ export class Jaunt {
   }
 
   /** Live share: add files to the running session. Hashes first, then
-   *  hands the specs to the core, which emits the APPEND frame. */
+   *  hands the specs to the core, which emits the APPEND frame. An entry
+   *  with `supersedes` replaces that record (same name+path). */
   async appendFiles(entries: (File | ShareEntry)[]): Promise<boolean> {
     const items = entries.map(normalizeEntry);
     if (!items.length || !this.core || !this.transport) return false;
-    const specs: { name: string; path: string; size: number; sha256: string; gzip: boolean }[] = [];
-    for (const { file, path } of items) {
-      specs.push({ name: file.name, path, size: file.size, sha256: await this.sha256Hex(file), gzip: this.gzipMode === 'on' });
+    const specs: { name: string; path: string; size: number; sha256: string; gzip: boolean; supersedes?: number }[] = [];
+    for (const { file, path, supersedes } of items) {
+      const spec: { name: string; path: string; size: number; sha256: string; gzip: boolean; supersedes?: number } = {
+        name: file.name,
+        path,
+        size: file.size,
+        sha256: await this.sha256Hex(file),
+        gzip: this.gzipMode === 'on',
+      };
+      if (supersedes !== undefined) spec.supersedes = supersedes;
+      specs.push(spec);
     }
     try {
+      // ids continue the manifest, not the local rec list (superseded
+      // receiver records are dropped, so recs.length can lag) — read the
+      // current ids BEFORE the core extends the manifest
+      const ids = this.core.fileIds();
+      const base = ids.length ? ids[ids.length - 1] + 1 : 0;
       this.core.appendFiles(JSON.stringify(specs));
-      const base = this.recs.length;
       specs.forEach((s, i) =>
         this.recs.push({
           id: base + i,
@@ -478,6 +531,86 @@ export class Jaunt {
       this.events.step(String(e));
       return false;
     }
+  }
+
+  /** Live folder sync: mirror an FSA directory into the session. Reads the
+   *  tree now, registers a watched root and returns the entries it staged
+   *  (pre-start callers start the share with them; an active live session
+   *  gets an APPEND/REMOVE diff directly). */
+  async watchFolder(handle: FileSystemDirectoryHandle): Promise<ShareEntry[]> {
+    let root = this.watched.find((r) => r.name === handle.name && r.handle === handle);
+    if (!root) {
+      root = { name: handle.name, handle, files: new Map() };
+      this.watched.push(root);
+    }
+    const entries = await this.syncRoot(root);
+    if (this.hook.state === 'transferring') this.startWatchPolling();
+    return entries;
+  }
+
+  /** Live folder sync for webkitdirectory inputs (Firefox/Safari fallback):
+   *  group by first path component, register/refresh each root's baseline,
+   *  and diff it against the session. Re-picking the folder is the manual
+   *  sync step where FSA handles are unavailable. */
+  async addFolderPick(files: File[]): Promise<ShareEntry[]> {
+    interface PickedFile {
+      file: File;
+      mtime: number;
+    }
+    const groups = new Map<string, Map<string, PickedFile>>();
+    for (const file of files) {
+      const rel = (file.webkitRelativePath ?? '').replace(/^\/+/, '');
+      const slash = rel.indexOf('/');
+      if (slash < 0) continue; // not a directory pick: nothing to watch
+      const rootName = rel.slice(0, slash);
+      const sub = rel.slice(slash + 1);
+      let group = groups.get(rootName);
+      if (!group) groups.set(rootName, (group = new Map()));
+      group.set(sub, { file, mtime: file.lastModified });
+    }
+    const entries: ShareEntry[] = [];
+    for (const [rootName, group] of groups) {
+      let root = this.watched.find((r) => r.name === rootName && !r.handle);
+      if (!root) {
+        root = { name: rootName, files: new Map() };
+        this.watched.push(root);
+      }
+      const next = new Map<string, { file: File; mtime: number; size: number }>();
+      for (const [sub, picked] of group) next.set(sub, { file: picked.file, mtime: picked.mtime, size: picked.file.size });
+      entries.push(...(await this.applyRootDiff(root, next)));
+    }
+    return entries;
+  }
+
+  /** Live folder sync: re-read every FSA-backed root now (the manual
+   *  Re-scan affordance; the ~3 s poll calls this while visible). */
+  async rescan(): Promise<void> {
+    if (this.scanning) return;
+    this.scanning = true;
+    try {
+      for (const root of this.watched) {
+        if (root.handle) await this.syncRoot(root);
+      }
+    } finally {
+      this.scanning = false;
+    }
+  }
+
+  /** Re-request read access for a watched root (must run from a click:
+   *  permission prompts need a user gesture). */
+  async grantRoot(name: string): Promise<void> {
+    const root = this.watched.find((r) => r.name === name && r.handle);
+    if (!root?.handle) return;
+    const h = root.handle;
+    if (h.requestPermission) {
+      const state = await h.requestPermission({ mode: 'read' });
+      if (state !== 'granted') {
+        this.events.step(`access to ${name} was not granted`);
+        return;
+      }
+    }
+    root.needsGrant = false;
+    await this.syncRoot(root);
   }
 
   /** Live share: leave cleanly (BYE to the peer, session ends). */
@@ -536,6 +669,7 @@ export class Jaunt {
   destroy(): void {
     this.pumpGen++;
     clearInterval(this.badgeTimer);
+    this.stopWatchPolling();
     this.relay?.close();
     this.relay = null;
     this.transport?.close();
@@ -551,6 +685,8 @@ export class Jaunt {
   private setState(s: JauntState): void {
     this.hook.state = s;
     this.events.state(s);
+    if (s === 'transferring') this.startWatchPolling();
+    if (s === 'done' || s === 'failed') this.stopWatchPolling();
   }
 
   private log(line: string): void {
@@ -583,6 +719,7 @@ export class Jaunt {
         sha256: r.sha256,
         verified: r.verified,
         paused: r.paused,
+        removed: r.removed,
         sinkLabel: r.sinkLabel,
       })),
     );
@@ -591,6 +728,136 @@ export class Jaunt {
   private take(): FjActionJson[] {
     if (!this.core) return [];
     return this.core.takeActions() as FjActionJson[];
+  }
+
+  // -- live folder sync internals ---------------------------------------------
+
+  private startWatchPolling(): void {
+    if (this.watchTimer !== null || typeof document === 'undefined') return;
+    this.watchTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible' && this.isLive) {
+        void this.rescan();
+      }
+    }, 3000);
+    document.addEventListener('visibilitychange', this.onVisibility);
+  }
+
+  private stopWatchPolling(): void {
+    if (this.watchTimer !== null) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = null;
+    }
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibility);
+  }
+
+  /** Read a root (permission-checked) and diff it against the session. */
+  private async syncRoot(root: WatchedRoot): Promise<ShareEntry[]> {
+    const handle = root.handle;
+    if (!handle || !(await this.ensureReadable(root))) return [];
+    let next: Map<string, { file: File; mtime: number; size: number }>;
+    try {
+      next = await this.readHandleTree(handle);
+    } catch (e) {
+      this.log(`scan ${root.name} failed: ${e}`);
+      return [];
+    }
+    return this.applyRootDiff(root, next);
+  }
+
+  /** FSA read permission is lost on reload: ask for it once and hint. */
+  private async ensureReadable(root: WatchedRoot): Promise<boolean> {
+    const handle = root.handle;
+    if (!handle) return false;
+    if (!handle.queryPermission) return true;
+    const state = await handle.queryPermission({ mode: 'read' });
+    if (state === 'granted') {
+      root.needsGrant = false;
+      return true;
+    }
+    if (!root.needsGrant) this.events.step(`re-grant access to ${root.name} to keep it syncing`);
+    root.needsGrant = true;
+    return false;
+  }
+
+  /** Recursive directory listing: subpath (after the root) -> file metadata. */
+  private async readHandleTree(
+    dir: FileSystemDirectoryHandle,
+    prefix = '',
+  ): Promise<Map<string, { file: File; mtime: number; size: number }>> {
+    const out = new Map<string, { file: File; mtime: number; size: number }>();
+    for await (const entry of dir.values()) {
+      const sub = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.kind === 'directory') {
+        for (const [k, v] of await this.readHandleTree(entry as FileSystemDirectoryHandle, sub)) out.set(k, v);
+      } else {
+        const file = await (entry as FileSystemFileHandle).getFile();
+        out.set(sub, { file, mtime: file.lastModified, size: file.size });
+      }
+    }
+    return out;
+  }
+
+  /** Diff one root against the live session and perform the wire actions:
+   *  new subpath = append, missing subpath = REMOVE, changed metadata =
+   *  append with `supersedes`. Returns the entries that were (or would be)
+   *  appended. Baseline advances only when every action succeeded, so a
+   *  failed append is retried on the next scan. */
+  private async applyRootDiff(
+    root: WatchedRoot,
+    next: Map<string, { file: File; mtime: number; size: number }>,
+  ): Promise<ShareEntry[]> {
+    const entries: ShareEntry[] = [];
+    const removals: number[] = [];
+    const live = this.hook.state === 'transferring' && !!this.core && !!this.transport;
+    for (const [sub, wf] of next) {
+      const rec = this.recForRootPath(root.name, sub);
+      const old = root.files.get(sub);
+      const changed = !!old && (old.size !== wf.size || old.mtime !== wf.mtime);
+      if (!rec) {
+        // pre-start: only files seen for the first time (or edited since
+        // the last pick) are staged, so re-picking the same folder is a no-op
+        if (live || !old || changed) entries.push({ file: wf.file, path: shareDir(root.name, sub) });
+      } else if (changed) {
+        entries.push({ file: wf.file, path: shareDir(root.name, sub), supersedes: rec.id });
+      }
+    }
+    for (const sub of root.files.keys()) {
+      if (next.has(sub)) continue;
+      const rec = this.recForRootPath(root.name, sub);
+      if (rec) removals.push(rec.id);
+    }
+    let ok = true;
+    if (live) {
+      if (removals.length) {
+        try {
+          for (const id of removals) {
+            this.core!.removeFile(id);
+            const rec = this.recById(id);
+            if (rec) rec.removed = true;
+          }
+          await this.applyActions(this.take());
+          this.emitFiles();
+          this.log(`${root.name}: removed ${removals.length} file(s) on the sender`);
+        } catch (e) {
+          ok = false;
+          this.log(`remove failed: ${e}`);
+        }
+      }
+      if (entries.length) {
+        ok = (await this.appendFiles(entries)) && ok;
+        this.log(`${root.name}: synced ${entries.length} file(s)`);
+      }
+    }
+    if (!live || ok) root.files = next;
+    return entries;
+  }
+
+  /** Newest non-removed record for a root-relative subpath. */
+  private recForRootPath(rootName: string, sub: string): FileRec | undefined {
+    const slash = sub.lastIndexOf('/');
+    const path = slash < 0 ? rootName : `${rootName}/${sub.slice(0, slash)}`;
+    const name = slash < 0 ? sub : sub.slice(slash + 1);
+    return this.recs.findLast((r) => r.path === path && r.name === name && !r.removed);
   }
 
   private fail(msg: string): void {
@@ -693,9 +960,18 @@ export class Jaunt {
           break;
         }
         case 'filesAdded': {
-          // live share: the peer appended files; create receiver records
-          const added = (a.files ?? []) as { id: number; name: string; path: string; size: number; chunks: number; chunk_size: number }[];
+          // live share: the peer appended files; create receiver records and
+          // drop any record the entry supersedes (same name+path re-sent)
+          const added = (a.files ?? []) as ManifestFileJson[];
           for (const f of added) {
+            if (f.supersedes !== undefined) {
+              const idx = this.recs.findIndex((r) => r.id === f.supersedes);
+              if (idx >= 0) {
+                const old = this.recs[idx];
+                await old.sink?.close();
+                this.recs.splice(idx, 1);
+              }
+            }
             if (this.recById(f.id)) continue;
             this.recs.push({
               id: f.id,
@@ -708,8 +984,20 @@ export class Jaunt {
               wireBytes: 0,
             });
           }
+          this.events.filesAdded?.(added);
           this.emitFiles();
           this.log(`peer appended ${added.length} file(s)`);
+          break;
+        }
+        case 'fileRemoved': {
+          // live share: removed on the sender; the local copy is kept
+          const rec = this.recById(a.file as number);
+          if (rec) {
+            rec.removed = true;
+            await rec.sink?.close();
+            this.log(`peer removed ${rec.name}; kept locally`);
+          }
+          this.emitFiles();
           break;
         }
         case 'text': {
@@ -908,6 +1196,19 @@ export class Jaunt {
     return h.finish();
   }
 
+  /** Watched roots whose baseline overlaps the files being sent survive a
+   *  new session: the pre-start pick registered them, and the live diff
+   *  must compare against exactly those bytes afterwards. */
+  private carryWatchedRoots(items: { file: File; path: string }[]): WatchedRoot[] {
+    const sent = new Set(items.map(({ file, path }) => (path ? `${path}/${file.name}` : file.name)));
+    return this.watched.filter((root) => {
+      for (const sub of root.files.keys()) {
+        if (sent.has(`${root.name}/${sub}`)) return true;
+      }
+      return false;
+    });
+  }
+
   /** Fresh session state: a second pairing in the same tab must not inherit
    * the previous run's files, player, storage handles or pairing step. */
   private resetSession(): void {
@@ -927,6 +1228,8 @@ export class Jaunt {
     this.expect = 'none';
     this.chain = Promise.resolve();
     this.recs.length = 0;
+    this.stopWatchPolling();
+    this.watched = [];
     this.hook.files = [];
     this.hook.resumedChunks = 0;
     this.hook.wireBytes = 0;
@@ -943,6 +1246,7 @@ export class Jaunt {
   private async startSender(entries: (File | ShareEntry)[], opts: SendOptions): Promise<void> {
     const items = entries.map(normalizeEntry);
     if (!items.length) return;
+    const carriedRoots = this.carryWatchedRoots(items);
     this.resetSession();
     this.setState('pairing');
     this.events.step('hashing files…');
@@ -995,6 +1299,7 @@ export class Jaunt {
         source: items[i].file,
       }),
     );
+    this.watched = carriedRoots;
     this.manifestLoaded = true;
     this.emitFiles();
     this.events.passphrase(this.passphrase);
@@ -1278,9 +1583,16 @@ export class Jaunt {
 }
 
 /** File or {file, path} entry to its (file, folder-path) pair. */
-function normalizeEntry(e: File | ShareEntry): { file: File; path: string } {
-  if ('file' in e) return { file: e.file, path: e.path.replace(/^\/+|\/+$/g, '') };
+function normalizeEntry(e: File | ShareEntry): { file: File; path: string; supersedes?: number } {
+  if ('file' in e) return { file: e.file, path: e.path.replace(/^\/+|\/+$/g, ''), supersedes: e.supersedes };
   const parts = (e.webkitRelativePath ?? '').split('/').filter(Boolean);
   parts.pop(); // last component is the name itself
   return { file: e, path: parts.join('/') };
+}
+
+/** Folder path for a root + root-relative subpath ("photos" + "a/x.jpg" ->
+ *  "photos/a"). */
+function shareDir(root: string, sub: string): string {
+  const slash = sub.lastIndexOf('/');
+  return slash < 0 ? root : `${root}/${sub.slice(0, slash)}`;
 }

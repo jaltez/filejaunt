@@ -35,6 +35,11 @@ pub struct FileEntry {
     pub chunk_size: u32,
     /// hex64 SHA-256 of the full file.
     pub sha256: String,
+    /// Live-share M4: this entry replaces manifest entry `supersedes`
+    /// (same name+path). Skipped when absent so old manifests stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +68,9 @@ pub struct FileSpec {
     pub sha256: String,
     /// Resolved per-file compression decision (true = compress chunks).
     pub gzip: bool,
+    /// Live-share M4: id of the manifest entry this file replaces.
+    #[serde(default)]
+    pub supersedes: Option<u16>,
 }
 
 pub fn chunks_for(size: u64, chunk_size: u32) -> u64 {
@@ -114,6 +122,7 @@ pub fn build_manifest(
             chunks,
             chunk_size,
             sha256: s.sha256.to_lowercase(),
+            supersedes: None,
         });
     }
     let gzip_any = specs.iter().any(|s| s.gzip);
@@ -156,6 +165,7 @@ pub fn build_entry(id: u16, s: &FileSpec, chunk_size: u32) -> Result<FileEntry> 
         chunks,
         chunk_size,
         sha256: s.sha256.to_lowercase(),
+        supersedes: s.supersedes,
     })
 }
 

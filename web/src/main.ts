@@ -59,7 +59,7 @@ function renderFiles(files: FileView[]): void {
       files.map((f) => ({
         name: f.name,
         progress: f.progress,
-        detail: `${f.progress}% ${fmtBytes(f.wireBytes)}${f.verified ? ' verified' : ''}`,
+        detail: `${f.progress}% ${fmtBytes(f.wireBytes)}${f.verified ? ' verified' : ''}${f.removed ? ' removed on the sender' : ''}`,
       })),
     );
   }
@@ -122,19 +122,56 @@ async function boot(): Promise<void> {
     ui.qs<HTMLElement>('#pair').classList.remove('hide');
     ui.setStep('paste blob-1 and the passphrase, then press Process');
   };
+  const sendOptions = () => ({
+    words: Number(ui.qs<HTMLInputElement>('#words').value) || 6,
+    privatePairing: ui.qs<HTMLInputElement>('#private3').checked,
+    channels: Number(ui.qs<HTMLSelectElement>('#channels').value) || 1,
+    gzip: ui.qs<HTMLSelectElement>('#gzip').value as 'auto' | 'on' | 'off',
+    live: ui.qs<HTMLInputElement>('#live').checked,
+  });
   ui.qs<HTMLInputElement>('#file-input').addEventListener('change', (e) => {
     const input = e.target as HTMLInputElement;
     const files = [...(input.files ?? [])];
-    void jaunt
-      .send(files, {
-        words: Number(ui.qs<HTMLInputElement>('#words').value) || 6,
-        privatePairing: ui.qs<HTMLInputElement>('#private3').checked,
-        channels: Number(ui.qs<HTMLSelectElement>('#channels').value) || 1,
-        gzip: ui.qs<HTMLSelectElement>('#gzip').value as 'auto' | 'on' | 'off',
-        live: ui.qs<HTMLInputElement>('#live').checked,
-      })
-      .catch((e) => ui.log(`error: ${e}`));
+    void jaunt.send(files, sendOptions()).catch((e) => ui.log(`error: ${e}`));
   });
+  // webkitdirectory picks keep their structure; the first pick also seeds the
+  // watched baseline so later re-picks can diff edits and deletions
+  ui.qs<HTMLInputElement>('#file-input-dir').addEventListener('change', (e) => {
+    const input = e.target as HTMLInputElement;
+    const files = [...(input.files ?? [])];
+    input.value = '';
+    void jaunt
+      .addFolderPick(files)
+      .then((entries) => {
+        if (jaunt.hook.state === 'transferring') {
+          ui.log(`folder re-scan: ${entries.length} change(s) staged`);
+        } else if (entries.length) {
+          void jaunt.send(entries, sendOptions()).catch((err) => ui.log(`error: ${err}`));
+        }
+      })
+      .catch((err) => ui.log(`folder pick: ${err}`));
+  });
+  if (window.showDirectoryPicker) {
+    ui.qs<HTMLElement>('#watch-folder').classList.remove('hide');
+    ui.qs<HTMLElement>('#rescan').classList.remove('hide');
+  }
+  ui.qs<HTMLElement>('#watch-folder').onclick = () => {
+    if (!window.showDirectoryPicker) return;
+    void window
+      .showDirectoryPicker()
+      .then(async (d) => {
+        const entries = await jaunt.watchFolder(d);
+        if (jaunt.hook.state !== 'transferring' && jaunt.hook.state !== 'done') {
+          await jaunt.send(entries, sendOptions());
+          // send() starts a fresh session state; re-register the root so
+          // the ~3 s poll keeps mirroring it (existing recs are adopted)
+          await jaunt.watchFolder(d);
+        }
+        ui.setStep('watching folder; changes sync while the share is live');
+      })
+      .catch((e) => ui.log(`watch folder: ${e}`));
+  };
+  ui.qs<HTMLElement>('#rescan').onclick = () => void jaunt.rescan();
   ui.qs<HTMLInputElement>('#append-input').addEventListener('change', (e) => {
     const input = e.target as HTMLInputElement;
     const files = [...(input.files ?? [])];

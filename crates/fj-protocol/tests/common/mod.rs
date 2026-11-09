@@ -44,6 +44,7 @@ pub enum Event {
     Receipt,
     Text(String),
     FilesAdded(usize),
+    FileRemoved(u16),
     SessionDone,
     Fail {
         code: ErrorCode,
@@ -114,6 +115,7 @@ impl Loop {
                 size: data.len() as u64,
                 sha256: sha256_hex(data),
                 gzip: false,
+                supersedes: None,
             })
             .collect();
         if live {
@@ -192,6 +194,7 @@ impl Loop {
                 Action::FilesAdded(files) => {
                     self.events(role, Event::FilesAdded(files.len()));
                 }
+                Action::FileRemoved { file } => self.events(role, Event::FileRemoved(file)),
                 Action::Fail { code, msg } => self.events(role, Event::Fail { code, msg }),
             }
         }

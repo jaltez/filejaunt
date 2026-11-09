@@ -311,6 +311,7 @@ impl Engine {
                     size,
                     sha256: sha,
                     gzip: gzip_on,
+                    supersedes: None,
                 },
                 path: path.clone(),
             });
@@ -1229,6 +1230,7 @@ impl Engine {
             | Action::SaveState
             | Action::EmitText(_)
             | Action::FilesAdded(_)
+            | Action::FileRemoved { .. }
             | Action::Fail { .. }
             | Action::SessionDone => self.route_notice(rx, a).await,
         }
@@ -1304,6 +1306,17 @@ impl Engine {
                     Mode::Human => self
                         .out
                         .stderr_line(&format!("{} file(s) added to the share", files.len())),
+                }
+                Ok(false)
+            }
+            Action::FileRemoved { file } => {
+                match self.out.mode {
+                    Mode::Json => self.out.json(serde_json::json!({
+                        "type": "fileRemoved", "file": file,
+                    })),
+                    Mode::Human => self
+                        .out
+                        .stderr_line(&format!("file {file} removed on the sender")),
                 }
                 Ok(false)
             }

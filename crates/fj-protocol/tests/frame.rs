@@ -17,6 +17,7 @@ fn sample_manifest() -> fj_protocol::Manifest {
             size: 40000,
             sha256: "a".repeat(64),
             gzip: false,
+            supersedes: None,
         }],
         16384,
     )

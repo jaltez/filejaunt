@@ -96,6 +96,7 @@ fn gen_vectors() {
             size: FILE_DATA.len() as u64,
             sha256: hex::encode(crypto::sha256(&[FILE_DATA])),
             gzip: false,
+            supersedes: None,
         }],
         CHUNK_SIZE,
     )

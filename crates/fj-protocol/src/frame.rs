@@ -41,6 +41,9 @@ pub enum FrameType {
     Bye = 0x0D,
     /// Live-share extension: only between peers that advertised CAPS_APPEND.
     Append = 0x0E,
+    /// Live-share extension (M4): the file was removed on the sender.
+    /// Only between peers that advertised CAPS_SYNC.
+    Remove = 0x0F,
 }
 
 impl FrameType {
@@ -60,6 +63,7 @@ impl FrameType {
             0x0C => Done,
             0x0D => Bye,
             0x0E => Append,
+            0x0F => Remove,
             _ => return None,
         })
     }
@@ -69,6 +73,8 @@ impl FrameType {
 /// Gates every live-share frames so peers on the old protocol never see one.
 pub const CAPS_LIVE: u8 = 0x01;
 pub const CAPS_APPEND: u8 = 0x02;
+/// M4 folder sync: REMOVE frames + supersede-aware appends.
+pub const CAPS_SYNC: u8 = 0x04;
 
 /// Decoded frame. Payload-level validation is done here where cheap
 /// (structure, sizes); semantic validation happens in `session`.
@@ -122,6 +128,12 @@ pub enum Frame {
     /// Live share: new files added to the manifest (ids continue the
     /// existing sequence). Only sent between CAPS_APPEND peers.
     Append(Vec<FileEntry>),
+    /// Live share (M4): file removed on the sender. The receiver keeps
+    /// whatever it already has and marks it as removed. Only sent
+    /// between CAPS_SYNC peers.
+    Remove {
+        file: u16,
+    },
 }
 
 impl Frame {
@@ -141,6 +153,7 @@ impl Frame {
             Frame::Done { .. } => Done,
             Frame::Bye => Bye,
             Frame::Append(_) => Append,
+            Frame::Remove { .. } => Remove,
         }
     }
 
@@ -153,7 +166,8 @@ impl Frame {
             | Frame::Pause { file }
             | Frame::Resume { file }
             | Frame::Cancel { file }
-            | Frame::Done { file } => *file,
+            | Frame::Done { file }
+            | Frame::Remove { file } => *file,
             _ => 0,
         }
     }
@@ -227,7 +241,8 @@ impl Frame {
             Frame::Pause { file }
             | Frame::Resume { file }
             | Frame::Cancel { file }
-            | Frame::Done { file } => {
+            | Frame::Done { file }
+            | Frame::Remove { file } => {
                 let j = serde_json::json!({"file": file});
                 out.extend_from_slice(j.to_string().as_bytes());
             }
@@ -424,6 +439,9 @@ impl Frame {
                 let a: A = decode_json(payload)?;
                 Ok(Frame::Append(a.files))
             }
+            Remove => Ok(Frame::Remove {
+                file: file_json(payload)?,
+            }),
         }
     }
 }
