@@ -338,9 +338,13 @@ export class Jaunt {
   /** Live folder sync (M4): watched roots and their polling loop. */
   private watched: WatchedRoot[] = [];
   private watchTimer: number | null = null;
-  private scanning = false;
+  /** Serializes root scans (poll, manual re-scan, picks) to one flight. */
+  private scanChain: Promise<void> = Promise.resolve();
   private readonly onVisibility = (): void => {
     if (typeof document !== 'undefined' && document.visibilityState === 'visible') void this.rescan();
+  };
+  private readonly onFocus = (): void => {
+    if (this.isLive) void this.rescan();
   };
 
   private constructor(opts: JauntOptions) {
@@ -498,6 +502,9 @@ export class Jaunt {
       const ids = this.core.fileIds();
       const base = ids.length ? ids[ids.length - 1] + 1 : 0;
       this.core.appendFiles(JSON.stringify(specs));
+      // flush APPEND before the pump can see the new ids: the pump only
+      // plans records that exist, and those are created after this await
+      await this.applyActions(this.take());
       specs.forEach((s, i) =>
         this.recs.push({
           id: base + i,
@@ -522,7 +529,6 @@ export class Jaunt {
           this.core.resolveGzipAuto(base + i, samples);
         }
       }
-      await this.applyActions(this.take());
       this.emitFiles();
       this.log(`appended ${items.length} file(s)`);
       return true;
@@ -536,14 +542,33 @@ export class Jaunt {
   /** Live folder sync: mirror an FSA directory into the session. Reads the
    *  tree now, registers a watched root and returns the entries it staged
    *  (pre-start callers start the share with them; an active live session
-   *  gets an APPEND/REMOVE diff directly). */
+   *  gets an APPEND/REMOVE diff directly). Re-picking the same directory
+   *  (a fresh handle object) merges into the existing root; a different
+   *  directory with the same base name is refused because both would share
+   *  the same output folder. */
   async watchFolder(handle: FileSystemDirectoryHandle): Promise<ShareEntry[]> {
+    if (this.freshPick() && (this.recs.length || this.watched.length)) this.clearStalePicks();
     let root = this.watched.find((r) => r.name === handle.name && r.handle === handle);
     if (!root) {
+      for (const r of this.watched) {
+        if (r.name !== handle.name || !r.handle) continue;
+        if (await r.handle.isSameEntry(handle)) {
+          root = r;
+          r.handle = handle;
+          break;
+        }
+      }
+    }
+    if (!root) {
+      if (this.watched.some((r) => r.name === handle.name)) {
+        this.events.step(`a different folder named ${handle.name} is already watched; rename one`);
+        return [];
+      }
       root = { name: handle.name, handle, files: new Map() };
       this.watched.push(root);
     }
-    const entries = await this.syncRoot(root);
+    const watched = root;
+    const entries = await this.enqueueScan(() => this.syncRoot(watched), []);
     if (this.hook.state === 'transferring') this.startWatchPolling();
     return entries;
   }
@@ -553,6 +578,7 @@ export class Jaunt {
    *  and diff it against the session. Re-picking the folder is the manual
    *  sync step where FSA handles are unavailable. */
   async addFolderPick(files: File[]): Promise<ShareEntry[]> {
+    if (this.freshPick() && (this.recs.length || this.watched.length)) this.clearStalePicks();
     interface PickedFile {
       file: File;
       mtime: number;
@@ -575,9 +601,10 @@ export class Jaunt {
         root = { name: rootName, files: new Map() };
         this.watched.push(root);
       }
+      const watched = root;
       const next = new Map<string, { file: File; mtime: number; size: number }>();
       for (const [sub, picked] of group) next.set(sub, { file: picked.file, mtime: picked.mtime, size: picked.file.size });
-      entries.push(...(await this.applyRootDiff(root, next)));
+      entries.push(...(await this.enqueueScan(() => this.applyRootDiff(watched, next), [])));
     }
     return entries;
   }
@@ -585,15 +612,11 @@ export class Jaunt {
   /** Live folder sync: re-read every FSA-backed root now (the manual
    *  Re-scan affordance; the ~3 s poll calls this while visible). */
   async rescan(): Promise<void> {
-    if (this.scanning) return;
-    this.scanning = true;
-    try {
+    await this.enqueueScan(async () => {
       for (const root of this.watched) {
         if (root.handle) await this.syncRoot(root);
       }
-    } finally {
-      this.scanning = false;
-    }
+    }, undefined);
   }
 
   /** Re-request read access for a watched root (must run from a click:
@@ -610,7 +633,9 @@ export class Jaunt {
       }
     }
     root.needsGrant = false;
-    await this.syncRoot(root);
+    const watched = root;
+    await this.enqueueScan(() => this.syncRoot(watched), []);
+    this.events.step(`re-granted access to ${name}; watching again`);
   }
 
   /** Live share: leave cleanly (BYE to the peer, session ends). */
@@ -732,6 +757,40 @@ export class Jaunt {
 
   // -- live folder sync internals ---------------------------------------------
 
+  /** Run `fn` after every previously queued scan: concurrent diffs of the
+   *  same root would append the same files twice. */
+  private enqueueScan<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+    const run = this.scanChain.then(fn, fn);
+    this.scanChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run.catch((e) => {
+      this.log(`scan failed: ${e}`);
+      return fallback;
+    });
+  }
+
+  /** No session owns records right now: picks stage a brand-new share. */
+  private freshPick(): boolean {
+    const s = this.hook.state;
+    return s === 'idle' || s === 'done' || s === 'failed';
+  }
+
+  private clearStalePicks(): void {
+    if (this.recs.length) {
+      this.recs.length = 0;
+      this.emitFiles();
+    }
+    for (const root of this.watched) root.files.clear();
+  }
+
+  /** True once HELO finished (core Active); guards the first live tick, when
+   *  the wrapper already reports "transferring" but appends would fail. */
+  private coreActive(): boolean {
+    return this.core !== null && coreDebug(this.core).phase === 'active';
+  }
+
   private startWatchPolling(): void {
     if (this.watchTimer !== null || typeof document === 'undefined') return;
     this.watchTimer = setInterval(() => {
@@ -740,6 +799,7 @@ export class Jaunt {
       }
     }, 3000);
     document.addEventListener('visibilitychange', this.onVisibility);
+    if (typeof window !== 'undefined') window.addEventListener('focus', this.onFocus);
   }
 
   private stopWatchPolling(): void {
@@ -748,6 +808,7 @@ export class Jaunt {
       this.watchTimer = null;
     }
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibility);
+    if (typeof window !== 'undefined') window.removeEventListener('focus', this.onFocus);
   }
 
   /** Read a root (permission-checked) and diff it against the session. */
@@ -799,16 +860,17 @@ export class Jaunt {
 
   /** Diff one root against the live session and perform the wire actions:
    *  new subpath = append, missing subpath = REMOVE, changed metadata =
-   *  append with `supersedes`. Returns the entries that were (or would be)
-   *  appended. Baseline advances only when every action succeeded, so a
-   *  failed append is retried on the next scan. */
+   *  append with `supersedes`. Failed removals (old peer, cancelled target)
+   *  are logged and not retried so they cannot rebuild the same diff every
+   *  poll; a rejected append is retried per entry so one unsyncable file
+   *  cannot wedge the root. */
   private async applyRootDiff(
     root: WatchedRoot,
     next: Map<string, { file: File; mtime: number; size: number }>,
   ): Promise<ShareEntry[]> {
     const entries: ShareEntry[] = [];
     const removals: number[] = [];
-    const live = this.hook.state === 'transferring' && !!this.core && !!this.transport;
+    const live = this.hook.state === 'transferring' && !!this.transport && this.coreActive();
     for (const [sub, wf] of next) {
       const rec = this.recForRootPath(root.name, sub);
       const old = root.files.get(sub);
@@ -826,29 +888,42 @@ export class Jaunt {
       const rec = this.recForRootPath(root.name, sub);
       if (rec) removals.push(rec.id);
     }
-    let ok = true;
     if (live) {
-      if (removals.length) {
+      let removed = 0;
+      for (const id of removals) {
         try {
-          for (const id of removals) {
-            this.core!.removeFile(id);
-            const rec = this.recById(id);
-            if (rec) rec.removed = true;
-          }
-          await this.applyActions(this.take());
-          this.emitFiles();
-          this.log(`${root.name}: removed ${removals.length} file(s) on the sender`);
+          this.core!.removeFile(id);
+          const rec = this.recById(id);
+          if (rec) rec.removed = true;
+          removed++;
         } catch (e) {
-          ok = false;
-          this.log(`remove failed: ${e}`);
+          this.log(`remove failed for ${root.name}: ${e}`);
         }
       }
+      if (removed) {
+        await this.applyActions(this.take());
+        this.emitFiles();
+        this.log(`${root.name}: removed ${removed} file(s) on the sender`);
+      }
       if (entries.length) {
-        ok = (await this.appendFiles(entries)) && ok;
+        if (!(await this.appendFiles(entries))) {
+          // a cancelled supersede target or an invalid name rejects the
+          // whole batch: retry alone so the other files still sync
+          for (const entry of entries) {
+            if (!(await this.appendFiles([entry]))) {
+              this.log(`dropping unsyncable file ${entry.path}/${entry.file.name}`);
+            }
+          }
+        }
         this.log(`${root.name}: synced ${entries.length} file(s)`);
       }
     }
-    if (!live || ok) root.files = next;
+    // Pre-start staging (no session yet) advances the baseline so a re-pick
+    // only stages new/changed files. Once a session exists but is not live
+    // (pairing), keep the old baseline: the entries were not applied, so a
+    // later scan/re-pick must still see them. Live cycles always advance:
+    // failures above were isolated/dropped on purpose.
+    if (live || !this.core) root.files = next;
     return entries;
   }
 
@@ -910,7 +985,8 @@ export class Jaunt {
           const id = a.file as number;
           const rec = this.recById(id);
           const data = new Uint8Array((a.data as number[]) ?? []);
-          if (rec) {
+          // a removed record keeps its bytes; late chunks for it are stale
+          if (rec && !rec.removed) {
             const sink = (rec.sink ??= await this.store!.sink(rec));
             rec.sinkLabel = sink.describe();
             await sink.writeChunk(a.index as number, rec.chunkSize, data);
@@ -1041,8 +1117,17 @@ export class Jaunt {
 
   private async hashFeedFile(id: number): Promise<void> {
     const rec = this.recById(id);
-    if (!rec || !this.core || !rec.sink) return;
-    await rec.sink.close();
+    if (!rec || !this.core) return;
+    if (rec.size === 0 && !rec.sink && this.store) {
+      // zero-chunk files never get saveChunk: create and truncate the target
+      // (a superseded old version must not linger) before hashing it empty
+      rec.sink = await this.store.sink(rec);
+      rec.sinkLabel = rec.sink.describe();
+      await rec.sink.writeChunk(0, rec.chunkSize || CHUNK, new Uint8Array(0));
+    }
+    const sink = rec.sink;
+    if (!sink) return;
+    await sink.close();
     if (rec.size === 0) {
       this.core.hashFeed(id, new Uint8Array(0));
       await this.applyActions(this.take());
@@ -1050,7 +1135,7 @@ export class Jaunt {
     }
     // stream the re-read in bounded slices: multi-GB files never sit in RAM
     for (let o = 0; o < rec.size; o += HASH_FEED_SLICE) {
-      const slice = await rec.sink.readSlice(o, Math.min(HASH_FEED_SLICE, rec.size - o));
+      const slice = await sink.readSlice(o, Math.min(HASH_FEED_SLICE, rec.size - o));
       this.core.hashFeed(id, slice);
       await this.applyActions(this.take());
     }
@@ -1081,12 +1166,19 @@ export class Jaunt {
     const raw = this.core.manifestJson();
     if (!raw) return Promise.resolve();
     this.manifestLoaded = true;
-    const m = JSON.parse(raw) as {
-      sid: string;
-      files: { id: number; name: string; path: string; size: number; chunks: number; chunk_size: number; sha256: string }[];
-    };
+    const m = JSON.parse(raw) as { sid: string; files: ManifestFileJson[] };
     this.hook.sid = m.sid;
+    // A resumed session restores a manifest that still lists retired ids:
+    // drop superseded entries (their replacement is the row) and mark
+    // REMOVE-retired records as removed instead of showing them as pending.
+    const rawRetired = coreDebug(this.core).retired;
+    const retired = new Set<number>(
+      Array.isArray(rawRetired) ? rawRetired.filter((x): x is number => typeof x === 'number') : [],
+    );
+    const superseded = new Set<number>();
+    for (const f of m.files) if (f.supersedes !== undefined) superseded.add(f.supersedes);
     for (const f of m.files) {
+      if (superseded.has(f.id)) continue;
       this.recs.push({
         id: f.id,
         name: f.name,
@@ -1096,6 +1188,7 @@ export class Jaunt {
         chunkSize: f.chunk_size,
         progress: 0,
         wireBytes: 0,
+        removed: retired.has(f.id) ? true : undefined,
       });
     }
     const video = this.recs.find((r) => r.name.toLowerCase().endsWith('.mp4'));
@@ -1146,6 +1239,10 @@ export class Jaunt {
       const rec = this.recById(id)!;
       const buf = new Uint8Array(await rec.source!.slice(index * CHUNK, index * CHUNK + len).arrayBuffer());
       if (gen !== this.pumpGen) return;
+      // the plan can change while the slice is read (a rescan may REMOVE or
+      // supersede this file, an ack may cover the chunk): never push for an
+      // id that is no longer next
+      if (this.core.nextSendChunk(id)?.[0] !== index) continue;
       let wire: Uint8Array<ArrayBuffer>;
       try {
         wire = this.core.pushChunkData(id, index, buf);
@@ -1579,6 +1676,19 @@ export class Jaunt {
     this.hook.checksum = sum;
     this.events.checksum(sum);
     this.log(`verification checksum: ${sum} — compare on both screens`);
+  }
+}
+
+/** Best-effort parse of `FjCore.debugJson()` (our own Rust output, still
+ *  never trusted blindly): only the fields the engine reads are surfaced. */
+function coreDebug(core: FjCore): { phase?: unknown; retired?: unknown } {
+  try {
+    const value: unknown = JSON.parse(core.debugJson());
+    if (!value || typeof value !== 'object') return {};
+    const record = value as Record<string, unknown>;
+    return { phase: record.phase, retired: record.retired };
+  } catch {
+    return {};
   }
 }
 

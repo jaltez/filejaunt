@@ -144,7 +144,9 @@ Core (`crates/fj-protocol`):
   `REMOVE` + `SaveState`.
 - `on_remove` (responder): initiator receiving REMOVE fails the pair;
   unknown ids fail; the first hit emits `Action::FileRemoved { file }` +
-  `SaveState`.
+  `SaveState`. Late chunks, DONE or BITMAPs for an already-retired id are
+  ignored, so a cross-channel chunk in flight cannot hash or fail a removed
+  file.
 - `append_files` / `on_append`: an entry carrying `supersedes` must target
   a live, non-cancelled, non-retired entry with the same `name`+`path`; the
   target id is retired on both sides. The receiver still emits only
@@ -171,9 +173,16 @@ Engine (`web/src/engine.ts`):
   `removed` (sink closed, bytes and download link kept). `FileView.removed`
   drives the "removed on the sender" note.
 
-Watch roots are runtime state: a new `send()`/re-pair starts a fresh
-session and does not carry them; the pad keeps the picked FSA handles and
-re-adopts them once the share starts (existing records are not re-sent).
+Limits/policies: moves re-transfer the bytes (REMOVE+APPEND, no cross-id
+dedupe); two watched folders with the same base name would share one output
+namespace, so the engine refuses a second FSA handle with that name (input
+picks cannot be distinguished — use distinct folder names). Watch roots are
+runtime state. `send()` starts a fresh session and carries
+only the roots whose baseline overlaps the entries being sent (the pad's
+pre-start picks); unrelated roots are dropped. A re-pair keeps the current
+roots and polling resumes once the session is live. Re-adopting a root
+after start only refreshes its baseline: files already in the manifest are
+not re-sent, files missing from it are appended as watching resumes.
 
 ## M4 compatibility
 

@@ -688,7 +688,7 @@ fn supersede_rejects_bad_target() {
 }
 
 #[test]
-fn remove_without_sync_caps_fails() {
+fn remove_guards_outside_active_and_unknown() {
     // non-live sessions auto-close: phase Done rejects remove_file
     let data = file_1mib();
     let mut l = Loop::new(&[("plain.bin".into(), data)], false);
@@ -705,4 +705,103 @@ fn remove_without_sync_caps_fails() {
     l.pump();
     assert!(l.ini.remove_file(99).is_err(), "unknown file id");
     assert!(!l.ini.is_failed());
+}
+
+#[test]
+fn non_live_remove_mid_transfer_completes() {
+    // one-shot session: removing the only (still unsettled) file settles it
+    let data = file_1mib();
+    let mut l = Loop::new(&[("big.bin".into(), data)], false);
+    l.push_n_chunks(10);
+    assert!(!l.ini.is_done());
+    let acts = l.ini.remove_file(0).expect("remove mid-transfer");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+    assert!(
+        l.events_ini.contains(&Event::SessionDone),
+        "sender completes once nothing is unsettled"
+    );
+    assert!(
+        l.events_rsp.contains(&Event::SessionDone),
+        "receiver completes too"
+    );
+    assert!(l.ini.is_done() && l.rsp.is_done());
+}
+
+#[test]
+fn supersede_mid_transfer_live_replaces_and_verifies() {
+    // retiring a partially-sent file must stop its chunks and still deliver
+    // the replacement in an open live session
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("swap.bin".into(), data)], false, true);
+    l.push_n_chunks(10);
+    let updated = prand(0x5eee, 300_000);
+    let specs = vec![fj_protocol::manifest::FileSpec {
+        name: "swap.bin".into(),
+        path: String::new(),
+        size: updated.len() as u64,
+        sha256: sha256_hex(&updated),
+        gzip: false,
+        supersedes: Some(0),
+    }];
+    l.add_file_source(1, updated.clone());
+    let acts = l.ini.append_files(&specs).expect("mid-transfer supersede");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+
+    assert_eq!(l.ini.next_send_chunk(0), None, "retired id stops sending");
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 1,
+        verified: true
+    }));
+    assert_eq!(l.received_file(1), updated);
+    assert!(
+        !l.ini.is_done() && !l.rsp.is_done(),
+        "live session stays open"
+    );
+}
+
+#[test]
+fn retired_survives_snapshot_restore() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("keep.bin".into(), data)], false, true);
+    l.pump();
+    let acts = l.ini.remove_file(0).expect("remove");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+
+    let restored = Session::restore(&l.ini.snapshot()).expect("restore");
+    let dbg: serde_json::Value = serde_json::from_str(&restored.debug_json()).unwrap();
+    assert_eq!(
+        dbg["retired"],
+        serde_json::Value::from(vec![0u16]),
+        "retired ids round-trip through the snapshot"
+    );
+    assert!(!restored.is_done(), "restored live session is not done");
+}
+
+#[test]
+fn late_chunks_after_remove_are_ignored() {
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("gone.bin".into(), data)], false, true);
+    l.push_n_chunks(5);
+    let acts = l.ini.remove_file(0).expect("remove mid-transfer");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FileRemoved(0)));
+
+    // a chunk already in flight when REMOVE landed must be dropped without
+    // writing, hashing, or failing the session
+    let idx = 5u64;
+    let start = (idx * 16384) as usize;
+    let bytes = l.source[&0][start..start + 16384].to_vec();
+    let (wire, _) = l.ini.push_chunk_data(0, idx, &bytes).unwrap();
+    let acts = l.rsp.on_frame(&wire).unwrap();
+    assert!(
+        !acts
+            .iter()
+            .any(|a| matches!(a, Action::SaveChunk { .. } | Action::HashFeed { .. })),
+        "retired traffic is ignored"
+    );
+    assert!(!l.rsp.is_failed());
 }

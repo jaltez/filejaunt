@@ -64,6 +64,7 @@ fn all_frames() -> Vec<Frame> {
             msg: "x".into(),
         },
         Frame::Done { file: 0 },
+        Frame::Remove { file: 3 },
     ]
 }
 

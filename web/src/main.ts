@@ -145,8 +145,10 @@ async function boot(): Promise<void> {
       .then((entries) => {
         if (jaunt.hook.state === 'transferring') {
           ui.log(`folder re-scan: ${entries.length} change(s) staged`);
-        } else if (entries.length) {
+        } else if (['idle', 'done', 'failed'].includes(jaunt.hook.state) && entries.length) {
           void jaunt.send(entries, sendOptions()).catch((err) => ui.log(`error: ${err}`));
+        } else if (entries.length) {
+          ui.log('folder re-scan queued; re-pick once the share is live');
         }
       })
       .catch((err) => ui.log(`folder pick: ${err}`));

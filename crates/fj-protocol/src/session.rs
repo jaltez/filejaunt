@@ -834,6 +834,11 @@ impl Session {
                 &format!("CHUNK for unknown file {file}"),
             ));
         };
+        if self.retired.contains(&file) {
+            // in-flight/cross-channel traffic for a removed file: keep the
+            // retained copy as-is, never hash or verify it
+            return Ok(vec![]);
+        }
         if index >= entry.chunks {
             self.phase = Phase::Failed;
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "chunk index out of range"));
@@ -912,6 +917,9 @@ impl Session {
                 &format!("DONE for unknown file {file}"),
             ));
         };
+        if self.retired.contains(&file) {
+            return Ok(vec![]);
+        }
         let f = self.file_mut(file).expect("file state");
         if f.file_done {
             return Ok(vec![]);
@@ -1030,6 +1038,9 @@ impl Session {
                 &format!("BITMAP for unknown file {file}"),
             ));
         };
+        if self.retired.contains(&file) {
+            return Ok(vec![]);
+        }
         let merged = self
             .file_mut(file)
             .expect("file state")
@@ -1691,7 +1702,14 @@ impl Session {
         if !self.retired.insert(file) {
             return Ok(vec![]);
         }
-        Ok(vec![self.send(Frame::Remove { file }), Action::SaveState])
+        let mut actions = vec![self.send(Frame::Remove { file }), Action::SaveState];
+        // like cancel: retiring the last unsettled file completes a one-shot
+        // session; a live share stays open
+        if self.all_files_settled_initiator() && !self.live_session() {
+            self.phase = Phase::Done;
+            actions.push(Action::SessionDone);
+        }
+        Ok(actions)
     }
 
     fn on_remove(&mut self, file: u16) -> Result<Vec<Action>> {
@@ -1726,7 +1744,12 @@ impl Session {
         if !self.retired.insert(file) {
             return Ok(vec![]);
         }
-        Ok(vec![Action::FileRemoved { file }, Action::SaveState])
+        let mut actions = vec![Action::FileRemoved { file }, Action::SaveState];
+        if self.all_files_settled_receiver() && !self.live_session() {
+            self.phase = Phase::Done;
+            actions.push(Action::SessionDone);
+        }
+        Ok(actions)
     }
 
     // ------------------------------------------------------------------
