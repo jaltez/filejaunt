@@ -209,7 +209,7 @@ async function boot(): Promise<void> {
     void window
       .showDirectoryPicker()
       .then((d) => {
-        jaunt.setDir(d);
+        void jaunt.setDir(d);
         ui.qs<HTMLElement>('#dir-note').textContent = `saving into ${d.name}/`;
         ui.log(`output folder: ${d.name}`);
       })

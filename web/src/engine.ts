@@ -39,6 +39,8 @@ export interface FileView {
   paused?: boolean;
   /** Live share: the sender removed this file; the receiver keeps its copy. */
   removed?: boolean;
+  /** A picked folder is the destination: the file already sits on disk there. */
+  onDisk?: boolean;
   sinkLabel?: string;
 }
 
@@ -668,9 +670,20 @@ export class Jaunt {
     this.emitFiles();
   }
 
-  /** Save received files into a user-picked directory (File System Access). */
-  setDir(dir: FjDirHandle | null): void {
+  /** Sync destination: files land in this folder tree as they cross. Takes
+   *  effect immediately — files already streaming keep their open sinks,
+   *  everything that arrives next (live appends included) opens in the new
+   *  folder. */
+  async setDir(dir: FjDirHandle | null): Promise<void> {
     this.pickedDir = dir;
+    if (this.store && this.hook.sid) {
+      this.store = await ReceiverStore.create(this.hook.sid, dir);
+      this.log(
+        dir
+          ? `saving into ${dir.name}/ from now on; earlier arrivals keep their open files`
+          : 'new arrivals go to this browser\'s private storage',
+      );
+    }
   }
 
   async diagnose(stunUrls: string[]): Promise<DoctorResult> {
@@ -745,6 +758,7 @@ export class Jaunt {
         verified: r.verified,
         paused: r.paused,
         removed: r.removed,
+        onDisk: this.store?.mode === 'fsa' || undefined,
         sinkLabel: r.sinkLabel,
       })),
     );
@@ -1100,9 +1114,10 @@ export class Jaunt {
 
   private finalizeFile(rec: FileRec): void {
     if (this.player && rec.id === this.playerFileId) this.player.finish();
-    if (rec.verified && rec.sink) {
-      // every storage mode offers a retrieval path: OPFS is origin-private, so
-      // the download is the only way out in browsers without FSA
+    if (rec.verified && rec.sink && this.store?.mode !== 'fsa') {
+      // private storage (OPFS/memory) is origin-private: the download event
+      // is the only way out. With a picked folder the file is already on
+      // disk in place — no per-file hand-saving.
       const sink = rec.sink;
       void sink
         .downloadBlob()
