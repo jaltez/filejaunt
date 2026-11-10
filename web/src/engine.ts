@@ -811,33 +811,34 @@ export class Jaunt {
     if (typeof window !== 'undefined') window.removeEventListener('focus', this.onFocus);
   }
 
-  /** Read a root (permission-checked) and diff it against the session. */
+  /** Read a root and diff it against the session. The read is attempted
+   *  unconditionally: a fresh picker grant must not depend on
+   *  queryPermission's answer, which is not reliably 'granted' right after
+   *  showDirectoryPicker. Lost access is detected from the read itself. */
   private async syncRoot(root: WatchedRoot): Promise<ShareEntry[]> {
     const handle = root.handle;
-    if (!handle || !(await this.ensureReadable(root))) return [];
+    if (!handle) return [];
     let next: Map<string, { file: File; mtime: number; size: number }>;
     try {
       next = await this.readHandleTree(handle);
     } catch (e) {
+      if (await this.permissionLost(root)) return [];
       this.log(`scan ${root.name} failed: ${e}`);
       return [];
     }
     return this.applyRootDiff(root, next);
   }
 
-  /** FSA read permission is lost on reload: ask for it once and hint. */
-  private async ensureReadable(root: WatchedRoot): Promise<boolean> {
+  /** True when the read failed because FSA access was withdrawn (lost on
+   *  reload or revoked): hint once so the chip's Re-grant can fix it. */
+  private async permissionLost(root: WatchedRoot): Promise<boolean> {
     const handle = root.handle;
-    if (!handle) return false;
-    if (!handle.queryPermission) return true;
+    if (!handle?.queryPermission) return false;
     const state = await handle.queryPermission({ mode: 'read' });
-    if (state === 'granted') {
-      root.needsGrant = false;
-      return true;
-    }
+    if (state === 'granted') return false;
     if (!root.needsGrant) this.events.step(`re-grant access to ${root.name} to keep it syncing`);
     root.needsGrant = true;
-    return false;
+    return true;
   }
 
   /** Recursive directory listing: subpath (after the root) -> file metadata. */
