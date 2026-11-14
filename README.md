@@ -14,6 +14,28 @@ covers the core repository; the product spec lives in
 [`docs/SECURITY.md`](docs/SECURITY.md). The WASM engine library is
 documented in [`docs/LIBRARY.md`](docs/LIBRARY.md).
 
+## How it works
+
+![reference web app, sender mid-transfer (staged data)](docs/screenshot.png)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Sender (browser or CLI)
+    participant R as Receiver (browser or CLI)
+    Note over S,R: no server in the path — the passphrase is spoken aloud, blobs travel by paste (or via a self-hosted relay as opaque ciphertext)
+    S->>S: hash files, gather ICE candidates
+    S-->>R: blob-1 — SPAKE2 message + offer SDP (FJ1. envelope)
+    R->>R: passphrase + blob-1 → SPAKE2 → session key
+    R-->>S: blob-2 — PAKE proof + answer SDP, encrypted under the session key
+    S->>R: WebRTC data channels connect (DTLS, host candidates on a LAN)
+    S->>R: HELO + manifest (AES-256-GCM layer keyed by SPAKE2)
+    S->>R: gzip chunks over up to 4 data channels
+    R-->>S: chunk receipts / loss bitmap
+    Note over S,R: drop or crash? same passphrase → resume from the bitmap (epoch+1)
+    R->>R: sha256 verify → receipt, checkable offline (filejaunt verify)
+```
+
 ## Quickstart
 
 ```sh
