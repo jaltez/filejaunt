@@ -7,6 +7,9 @@ browser↔CLI. No signaling server, no data relay, resumable, ephemeral by
 construction. Rust core (SPAKE2 + AES-256-GCM), WASM web client, CLI.
 Licensed AGPL-3.0-only.
 
+No install needed: **<https://filejaunt.com>** hosts the reference app —
+free to use, transfers never touch its server.
+
 Encrypted P2P file transfer: browser↔browser and browser↔CLI, no signaling
 server, no data relay, resumable, ephemeral by construction. This README
 covers the core repository; the product spec lives in
