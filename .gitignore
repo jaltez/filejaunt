@@ -7,8 +7,17 @@ test-results/
 *.local.*
 crates/fj-wasm/pkg/
 web/dist/
-.omp/
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+
+
+# agents
+.pi/
+.omp/
+.amp/
+.zcode/
+.opencode/
+.codegraph/
+.voyager/
