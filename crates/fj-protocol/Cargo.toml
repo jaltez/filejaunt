@@ -1,6 +1,6 @@
 [package]
 name = "fj-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "filejaunt core protocol: framing, crypto, PAKE, manifest, transfer state machine (sans-IO, pure)"
 license = "AGPL-3.0-only"

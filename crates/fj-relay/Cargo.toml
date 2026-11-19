@@ -1,6 +1,6 @@
 [package]
 name = "fj-relay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "filejaunt signaling relay: room-based WebSocket relay for pairing blobs. Sees ciphertext and room hashes only."
 license = "AGPL-3.0-only"
