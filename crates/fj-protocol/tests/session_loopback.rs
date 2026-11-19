@@ -805,3 +805,87 @@ fn late_chunks_after_remove_are_ignored() {
     );
     assert!(!l.rsp.is_failed());
 }
+
+#[test]
+fn resume_epoch_exhaustion_is_an_error_not_a_panic() {
+    // F14: a restored responder at epoch u32::MAX must reject resume with a
+    // clean error instead of panicking on the +1 overflow.
+    let data = file_1mib();
+    let mut l = Loop::new(&[("e.bin".into(), data)], false);
+    l.push_n_chunks(4);
+    let snap_i = l.ini.snapshot();
+    let snap_r = l.rsp.snapshot();
+    let patched = snap_r.replace("\"epoch\":0", "\"epoch\":4294967295");
+    assert!(patched.contains("\"epoch\":4294967295"), "patch applied");
+
+    let mut ini3 = Session::restore(&snap_i).unwrap();
+    let mut rsp3 = Session::restore(&patched).unwrap();
+    assert_eq!(rsp3.epoch(), u32::MAX);
+    // the initiator resumes normally (epoch 0 -> 1); the responder at MAX
+    // must fail the epoch check before any PAKE work
+    let blob1b = ini3
+        .resume_initiator("any-passphrase", "v=0\r\no=- next offer\r\n")
+        .unwrap();
+    let mut limiter = AttemptLimiter::new();
+    let e = rsp3
+        .resume_responder(
+            &blob1b,
+            "any-passphrase",
+            "v=0\r\no=- next answer\r\n",
+            &mut limiter,
+        )
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::ProtoMalformed);
+    assert!(e.msg().contains("epoch exhausted"));
+}
+
+#[test]
+fn append_replay_is_idempotent() {
+    // F9: re-delivering an APPEND the receiver already applied is a no-op —
+    // no duplicate FilesAdded, no state change, no failure.
+    let data = file_1mib();
+    let mut l = Loop::new_mode(&[("base.bin".into(), data)], false, true);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FileDone {
+        file: 0,
+        verified: true
+    }));
+
+    let extra = b"replayed append payload".to_vec();
+    let specs = vec![fj_protocol::manifest::FileSpec {
+        name: "late.bin".into(),
+        path: String::new(),
+        size: extra.len() as u64,
+        sha256: sha256_hex(&extra),
+        gzip: false,
+        supersedes: None,
+    }];
+    l.add_file_source(1, extra);
+    let acts = l.ini.append_files(&specs).expect("append");
+    let wire = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Send(w) => Some(w.clone()),
+            _ => None,
+        })
+        .expect("APPEND wire frame");
+    l.apply(Role::Initiator, acts);
+    l.pump();
+    assert!(l.events_rsp.contains(&Event::FilesAdded(1)));
+
+    // replay the identical encrypted APPEND frame
+    let replay = l.rsp.on_frame(&wire).expect("replay accepted");
+    assert!(
+        !replay.iter().any(|a| matches!(a, Action::FilesAdded(_))),
+        "replayed APPEND is a no-op"
+    );
+    assert_eq!(
+        l.events_rsp
+            .iter()
+            .filter(|e| matches!(e, Event::FilesAdded(_)))
+            .count(),
+        1,
+        "exactly one FilesAdded"
+    );
+    assert!(!l.rsp.is_failed());
+}

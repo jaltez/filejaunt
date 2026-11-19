@@ -228,6 +228,11 @@ pub struct Session {
     answer_sdp: String,
     tx_counter: u32,
     rx_counter: u32,
+    /// F1: one-shot guards — each p3 envelope subkey seals exactly one SDP
+    /// per pairing, so the GCM key+nonce pair is never reused. Reset only
+    /// on re-pairing (fresh K_root).
+    env_offer_sealed: bool,
+    env_answer_sealed: bool,
     ctrl_seq: u32,
     phase: Phase,
     helo_sent: bool,
@@ -362,6 +367,14 @@ impl Session {
 
     /// Initiator -> responder: encrypted offer.
     pub fn initiator_private_blob3(&mut self) -> Result<String> {
+        // F1: the envelope-offer subkey seals exactly one SDP per pairing;
+        // a second seal would reuse the GCM key+nonce.
+        if self.env_offer_sealed {
+            return err(
+                ErrorCode::SecPakeFailed,
+                "envelope key already used for this pairing",
+            );
+        }
         self.ensure_role(Role::Initiator)?;
         if !self.private3 {
             return err(ErrorCode::ProtoMalformed, "session is not in private mode");
@@ -372,10 +385,12 @@ impl Session {
             "sdp-offer",
             &self.offer_sdp,
         );
-        crate::envelope::serialize(&Envelope3 {
+        let blob = crate::envelope::serialize(&Envelope3 {
             v: PROTOCOL_VERSION,
             sdpe: crate::envelope::b64(&ct),
-        })
+        })?;
+        self.env_offer_sealed = true;
+        Ok(blob)
     }
 
     /// Responder decrypts blob-3 and returns the offer SDP for the glue to
@@ -410,6 +425,14 @@ impl Session {
 
     /// Responder -> initiator: encrypted answer (after the glue created it).
     pub fn responder_private_blob4(&mut self, answer_sdp: &str) -> Result<String> {
+        // F1: the envelope-answer subkey seals exactly one SDP per pairing;
+        // a second seal would reuse the GCM key+nonce.
+        if self.env_answer_sealed {
+            return err(
+                ErrorCode::SecPakeFailed,
+                "envelope key already used for this pairing",
+            );
+        }
         self.ensure_role(Role::Responder)?;
         self.answer_sdp = answer_sdp.to_string();
         let k = self.k_root.as_ref().expect("k_root");
@@ -418,10 +441,12 @@ impl Session {
             "sdp-answer",
             answer_sdp,
         );
-        crate::envelope::serialize(&Envelope4 {
+        let blob = crate::envelope::serialize(&Envelope4 {
             v: PROTOCOL_VERSION,
             sdpe: crate::envelope::b64(&ct),
-        })
+        })?;
+        self.env_answer_sealed = true;
+        Ok(blob)
     }
 
     /// Initiator consumes blob-4.
@@ -486,10 +511,13 @@ impl Session {
         if sid != self.sid {
             return err(ErrorCode::ProtoMalformed, "resume sid mismatch");
         }
-        if env1.ep != self.epoch + 1 {
+        let Some(next_epoch) = self.epoch.checked_add(1) else {
+            return err(ErrorCode::ProtoMalformed, "epoch exhausted");
+        };
+        if env1.ep != next_epoch {
             return err(ErrorCode::ProtoMalformed, "resume epoch must be exactly +1");
         }
-        self.epoch = env1.ep;
+        self.epoch = next_epoch;
         self.channels = env1.ch.clamp(1, crate::CHANNELS_MAX);
         self.private3 = matches!(mode, PairingMode::P3);
         self.reset_transport_state();
@@ -1178,7 +1206,7 @@ impl Session {
             gzip: gz,
             data,
         };
-        let wire = self.encrypt_frame(&frame);
+        let wire = self.encrypt_frame(&frame)?;
         let (done, wire_total) = {
             let f = self.file_mut(file).expect("file state");
             f.sent.set(index, true);
@@ -1440,7 +1468,7 @@ impl Session {
         if self.phase == Phase::Failed || self.phase == Phase::Done {
             return err(ErrorCode::ProtoMalformed, "session not active");
         }
-        Ok(self.encrypt_frame(&Frame::Text(text.to_string())))
+        self.encrypt_frame(&Frame::Text(text.to_string()))
     }
 
     // ------------------------------------------------------------------
@@ -1613,6 +1641,11 @@ impl Session {
             self.phase = Phase::Failed;
             return Ok(self.fail_pair(ErrorCode::ProtoMalformed, "empty APPEND"));
         }
+        // F9: replayed APPEND (re-delivery on another channel) is idempotent
+        // when every entry is already part of the manifest verbatim.
+        if entries.iter().all(|e| m.file(e.id) == Some(e)) {
+            return Ok(vec![]);
+        }
         let base = m.files.len() as u16;
         for (i, e) in entries.iter().enumerate() {
             let expect = base
@@ -1770,8 +1803,9 @@ impl Session {
         }
     }
 
-    /// Encrypt + advance the tx counter. Returns wire bytes.
-    fn encrypt_frame(&mut self, frame: &Frame) -> Vec<u8> {
+    /// Encrypt + advance the tx counter. Returns wire bytes; errors when the
+    /// counter is exhausted (F9: no wrap-around → no key+nonce reuse).
+    fn encrypt_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         // D4: the header `seq` field carries the encryption counter for
         // EVERY frame (chunk_index stays in the CHUNK payload), so frame
         // decryption never depends on cross-channel arrival order.
@@ -1789,14 +1823,22 @@ impl Session {
             &header,
             &plain[12..],
         );
-        self.tx_counter = self.tx_counter.wrapping_add(1);
+        self.tx_counter = self.tx_counter.checked_add(1).ok_or_else(|| {
+            crate::error::Error::new(ErrorCode::ProtoMalformed, "tx counter exhausted")
+        })?;
         let mut wire = plain[..12].to_vec();
         wire.extend_from_slice(&ct);
-        wire
+        Ok(wire)
     }
 
     fn send(&mut self, frame: Frame) -> Action {
-        Action::Send(self.encrypt_frame(&frame))
+        match self.encrypt_frame(&frame) {
+            Ok(wire) => Action::Send(wire),
+            Err(e) => Action::Fail {
+                code: e.code(),
+                msg: e.msg().to_string(),
+            },
+        }
     }
 
     fn decrypt(&mut self, header: &[u8; 12], ct: &[u8]) -> Result<Frame> {
@@ -1849,6 +1891,8 @@ impl Session {
             answer_sdp: String::new(),
             tx_counter: 0,
             rx_counter: 0,
+            env_offer_sealed: false,
+            env_answer_sealed: false,
             ctrl_seq: 0,
             phase: Phase::Paired,
             helo_sent: false,
@@ -1991,6 +2035,10 @@ impl Session {
     fn reset_transport_state(&mut self) {
         self.tx_counter = 0;
         self.rx_counter = 0;
+        // F1: re-pairing derives a fresh K_root; the one-shot envelope
+        // guards arm again for the new pairing.
+        self.env_offer_sealed = false;
+        self.env_answer_sealed = false;
         self.ctrl_seq = 0;
         self.helo_sent = false;
         self.helo_received = false;
@@ -2093,6 +2141,8 @@ impl Session {
             answer_sdp: String::new(),
             tx_counter: snap.tx,
             rx_counter: snap.rx,
+            env_offer_sealed: false,
+            env_answer_sealed: false,
             ctrl_seq: snap.ctrl_seq,
             phase: Phase::Paired,
             helo_sent: false,
@@ -2260,6 +2310,9 @@ impl Session {
     }
 
     /// K_root hex — TEST/vectors only (never log in production paths).
+    /// F8: compiled only under the `test-util` feature so no production or
+    /// third-party build ever exposes key material.
+    #[cfg(feature = "test-util")]
     pub fn k_root_hex_for_test(&self) -> Option<String> {
         self.k_root.as_ref().map(|k| hex::encode(**k))
     }

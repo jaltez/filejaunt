@@ -155,3 +155,75 @@ fn sha256_field() {
     };
     assert!(build_manifest(&[0u8; 16], 0, &[spec], 16384).is_err());
 }
+
+#[test]
+fn windows_hostile_names_rejected() {
+    // F11: unconditional rules — same criteria on every platform
+    let bad = [
+        "a:b",
+        "x. ",
+        "x.",
+        "CON",
+        "com1.txt",
+        "LPT9.tar.gz",
+        "aux",
+        "nul.txt",
+    ];
+    for n in bad {
+        let e = validate_name(n).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PathRejected, "name {n:?} rejected");
+    }
+    let ok = ["normal.txt", "a.b.c", "readme", "x.y.z.tar"];
+    for n in ok {
+        assert!(validate_name(n).is_ok(), "name {n:?} accepted");
+    }
+}
+
+#[test]
+fn duplicate_path_name_rejected() {
+    // F4: two manifest entries resolving to the same output path are
+    // rejected by Manifest::validate (receiver-side wire check).
+    let one = FileSpec {
+        name: "same.bin".into(),
+        path: "dir".into(),
+        size: 1,
+        sha256: "a".repeat(64),
+        gzip: false,
+        supersedes: None,
+    };
+    let mut m = build_manifest(&[0u8; 16], 0, &[one], 16384).unwrap();
+    let mut dup = m.files[0].clone();
+    dup.id = 1;
+    dup.sha256 = "b".repeat(64);
+    m.total += dup.size;
+    m.files.push(dup);
+    let e = m.validate().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::PathRejected);
+    assert!(e.msg().contains("duplicate path+name"), "got: {}", e.msg());
+
+    // same name in different dirs is fine
+    let specs = vec![
+        FileSpec {
+            name: "ok.bin".into(),
+            path: "d1".into(),
+            size: 1,
+            sha256: "a".repeat(64),
+            gzip: false,
+            supersedes: None,
+        },
+        FileSpec {
+            name: "ok.bin".into(),
+            path: "d2".into(),
+            size: 1,
+            sha256: "a".repeat(64),
+            gzip: false,
+            supersedes: None,
+        },
+    ];
+    assert!(
+        build_manifest(&[0u8; 16], 0, &specs, 16384)
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
+}

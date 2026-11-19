@@ -600,15 +600,13 @@ pub fn fj_role(core: &FjCore) -> String {
     }
 }
 
-/// Relay room id: first 8 hex of SHA-256 over the canonical passphrase.
-/// Deterministic so both peers (and resumes) meet in the same room; the
-/// relay cannot invert it. Mirrors the CLI's RelayHandle::room_from_passphrase.
+/// Relay room id: first 8 hex of SHA-256 over Argon2id(canonical
+/// passphrase). Deterministic so both peers (and resumes) meet in the same
+/// room; the memory-hard KDF blocks offline dictionaries. Mirrors the
+/// CLI's RelayHandle::room_from_passphrase.
 #[wasm_bindgen]
 pub fn fj_room_from_passphrase(passphrase: &str) -> String {
-    use sha2::Digest;
-    let canon = fj_protocol::pake::canonical_passphrase(passphrase);
-    let digest = sha2::Sha256::digest(canon.as_bytes());
-    hex::encode(digest)[..8].to_string()
+    fj_protocol::pake::room_from_passphrase(passphrase)
 }
 
 /// Split a pasted `fj-<room8>-<words>` one-line pairing code into

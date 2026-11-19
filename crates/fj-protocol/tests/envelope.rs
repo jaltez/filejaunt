@@ -157,3 +157,44 @@ fn tampered_envelope_fails() {
     let r = Session::responder_join(&tampered, &pass, ANSWER, &mut limiter);
     assert!(r.is_err());
 }
+
+#[test]
+fn p3_envelope_keys_are_one_shot() {
+    // F1: each p3 envelope subkey seals exactly one SDP per pairing; a
+    // second seal attempt (even with different SDP) must fail hard.
+    let mut limiter = AttemptLimiter::new();
+    let (mut ini, pass, blob1) = Session::initiator_new(opts_p3()).unwrap();
+    let (mut rsp, _blob2) = Session::responder_join(&blob1, &pass, "", &mut limiter).unwrap();
+    ini.initiator_accept(&_blob2).unwrap();
+    let blob3 = ini.initiator_private_blob3().unwrap();
+    let e = ini.initiator_private_blob3().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::SecPakeFailed);
+    assert!(e.msg().contains("already used"));
+
+    let offer = rsp.responder_private_offer(&blob3, &mut limiter).unwrap();
+    assert_eq!(offer, OFFER);
+    let _blob4 = rsp.responder_private_blob4(ANSWER).unwrap();
+    let e = rsp
+        .responder_private_blob4("v=0\r\no=- imposter answer\r\n")
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::SecPakeFailed);
+    assert!(e.msg().contains("already used"));
+
+    // The one-shot blobs themselves still complete the pairing normally.
+    ini.initiator_private_final(&_blob4).unwrap();
+    assert_eq!(ini.k_root_hex_for_test(), rsp.k_root_hex_for_test());
+}
+
+#[test]
+fn oversized_blob_input_rejected_before_decode() {
+    // F12: the raw blob is capped before any base64/gzip work
+    let big = format!("{}{}", "FJ1.", "A".repeat(600_000));
+    let e = fj_protocol::envelope::inflate(&big).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::ProtoMalformed);
+    assert!(e.msg().contains("too large"));
+    // exactly at the cap (prefix included) the input still reaches the
+    // base64 decoder — the cap is inclusive
+    let at_cap = format!("{}{}", "FJ1.", "A".repeat(512 * 1024 - 4));
+    let e = fj_protocol::envelope::inflate(&at_cap).unwrap_err();
+    assert_ne!(e.msg(), "blob input too large");
+}

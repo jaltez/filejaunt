@@ -209,6 +209,13 @@ impl Manifest {
             return err(ErrorCode::PathRejected, "too many files in manifest");
         }
         let mut ids = std::collections::HashSet::with_capacity(self.files.len());
+        // F4: two entries mapping to the same output path (path+name) must
+        // never silently overwrite each other on the receiver. Entries
+        // retired via `supersedes` are excluded: their replacement
+        // legitimately carries the same path.
+        let superseded: std::collections::HashSet<u16> =
+            self.files.iter().filter_map(|f| f.supersedes).collect();
+        let mut names = std::collections::HashSet::with_capacity(self.files.len());
         let mut total = 0u64;
         let mut total_chunks = 0u64;
         for f in &self.files {
@@ -216,6 +223,12 @@ impl Manifest {
                 return err(
                     ErrorCode::PathRejected,
                     format!("duplicate file id {}", f.id),
+                );
+            }
+            if !superseded.contains(&f.id) && !names.insert((f.path.clone(), f.name.clone())) {
+                return err(
+                    ErrorCode::PathRejected,
+                    format!("duplicate path+name {} / {}", f.path, f.name),
                 );
             }
             validate_name(&f.name)?;
@@ -271,8 +284,19 @@ impl Manifest {
     }
 }
 
+/// DOS reserved device names — hostile on Windows regardless of extension
+/// (`CON`, `CON.txt`, `con.example` all collide with the console device).
+const DOS_RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", //
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// File name rules: 1..=255 UTF-8 bytes, no '/', '\', NUL, control chars
-/// (< 0x20), not "." or "..".
+/// (< 0x20), not "." or "..". Unconditional Windows-hostile rules (same
+/// criteria for sender and receiver on every platform, F11): no ':' (NTFS
+/// alternate data streams / drive letters), no trailing '.' or ' ', and no
+/// DOS reserved device stem.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return err(ErrorCode::PathRejected, "empty file name");
@@ -287,6 +311,19 @@ pub fn validate_name(name: &str) -> Result<()> {
         if b == b'/' || b == b'\\' || b == 0 || b < 0x20 {
             return err(ErrorCode::PathRejected, "illegal byte in file name");
         }
+    }
+    if name.contains(':') {
+        return err(
+            ErrorCode::PathRejected,
+            "colon in file name (NTFS alternate data stream)",
+        );
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return err(ErrorCode::PathRejected, "file name ends with '.' or space");
+    }
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if DOS_RESERVED.contains(&stem.as_str()) {
+        return err(ErrorCode::PathRejected, "DOS reserved device name");
     }
     Ok(())
 }

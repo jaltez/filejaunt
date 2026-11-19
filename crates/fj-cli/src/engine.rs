@@ -1011,7 +1011,7 @@ impl Engine {
             peer,
             sid: hex::encode(sid),
             files: HashMap::new(),
-            confirmed: false,
+            preflighted: false,
             frames,
             relay,
         };
@@ -1039,6 +1039,13 @@ impl Engine {
         crate::signals::install(pause_flag, cancel_flag.clone());
 
         loop {
+            // F4: once the manifest is known (initial frame or resume
+            // snapshot), settle overwrite consent for every target in one
+            // prompt before any chunk touches disk.
+            if !rx.preflighted && rx.session.manifest().is_some() {
+                rx.preflighted = true;
+                self.preflight_collisions(&rx.session, out_dir)?;
+            }
             if cancel_flag.load(Ordering::SeqCst) {
                 for a in rx.session.cancel(FILE_ALL) {
                     if let Action::Send(bytes) = a {
@@ -1325,11 +1332,61 @@ impl Engine {
         }
     }
 
-    /// Open/create the target file once: ask before overwriting (unless
-    /// --yes), create parents, and fix the final length with `set_len` so a
-    /// stale larger file cannot leak a tail into the hash. On resume the
-    /// chunks already on disk are kept (same size), and missing chunks are
-    /// rewritten by offset.
+    /// Resolve a manifest entry to a path inside out_dir, rejecting any
+    /// symlink in the walked components (F5: never writes outside out_dir).
+    fn resolve_within(
+        out_dir: &Path,
+        entry: &fj_protocol::manifest::FileEntry,
+    ) -> Result<PathBuf, ErrorCode> {
+        let mut cur = out_dir.to_path_buf();
+        for comp in rel_path(&entry.path, &entry.name).split('/') {
+            cur.push(comp);
+            if let Ok(md) = std::fs::symlink_metadata(&cur)
+                && md.file_type().is_symlink()
+            {
+                return Err(ErrorCode::PathRejected);
+            }
+        }
+        Ok(cur)
+    }
+
+    /// F4: one up-front prompt listing every existing target file; no
+    /// per-file surprises mid-transfer. Aborts with StorageFailed unless the
+    /// user answers y (or --yes was given).
+    fn preflight_collisions(&self, session: &Session, out_dir: &Path) -> Result<(), ErrorCode> {
+        if self.yes {
+            return Ok(());
+        }
+        let Some(m) = session.manifest() else {
+            return Ok(());
+        };
+        let hits: Vec<PathBuf> = m
+            .files
+            .iter()
+            .filter_map(|e| Self::resolve_within(out_dir, e).ok())
+            .filter(|p| p.exists())
+            .collect();
+        if hits.is_empty() {
+            return Ok(());
+        }
+        for p in &hits {
+            eprintln!("file exists: {}", p.display());
+        }
+        eprint!("overwrite {} file(s)? [y/N] ", hits.len());
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        if !line.trim().eq_ignore_ascii_case("y") {
+            return Err(ErrorCode::StorageFailed);
+        }
+        Ok(())
+    }
+
+    /// Open/create the target file once: create parents, and fix the final
+    /// length with `set_len` so a stale larger file cannot leak a tail into
+    /// the hash. On resume the chunks already on disk are kept (same size),
+    /// and missing chunks are rewritten by offset. Overwrite consent is
+    /// settled by preflight_collisions before the transfer starts.
     fn ensure_target(&self, rx: &mut Receiver, out_dir: &Path, file: u16) -> Result<(), ErrorCode> {
         if rx.files.contains_key(&file) {
             return Ok(());
@@ -1339,27 +1396,24 @@ impl Engine {
             .manifest()
             .and_then(|m| m.file(file).cloned())
             .ok_or(ErrorCode::ProtoMalformed)?;
-        let path = out_dir.join(rel_path(&entry.path, &entry.name));
-        if !rx.confirmed && !self.yes && path.exists() {
-            eprintln!("file exists: {}", path.display());
-            eprint!("overwrite? [y/N] ");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            let _ = std::io::stdin().lock().read_line(&mut line);
-            if !line.trim().eq_ignore_ascii_case("y") {
-                return Err(ErrorCode::StorageFailed);
-            }
-        }
-        rx.confirmed = true;
+        let path = Self::resolve_within(out_dir, &entry)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| ErrorCode::StorageFailed)?;
         }
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|_| ErrorCode::StorageFailed)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // F5: O_NOFOLLOW — the final component must not be a symlink
+            // either (TOCTOU hardening on top of resolve_within)
+            opts.custom_flags(0x80000);
+        }
+        let f = opts.open(&path).map_err(|e| match e.raw_os_error() {
+            // ELOOP: O_NOFOLLOW hit a symlink
+            Some(17) => ErrorCode::PathRejected,
+            _ => ErrorCode::StorageFailed,
+        })?;
         f.set_len(entry.size)
             .map_err(|_| ErrorCode::StorageFailed)?;
         rx.files.insert(file, (path, Some(f)));
@@ -1429,16 +1483,13 @@ pub enum RelayEvent {
 }
 
 impl RelayHandle {
-    /// Room id derived from the typed passphrase (SHA-256, first 8 hex —
-    /// 4.3e9 ids make collisions among a relay's live rooms negligible).
-    /// Deterministic so both sides (and resumes) meet in the same room;
-    /// the relay cannot invert it. With a generated 77-bit passphrase this
-    /// leaks nothing usable; see SECURITY.md before allowing user-chosen
-    /// passphrases over the relay.
+    /// Room id derived from the typed passphrase (Argon2id then SHA-256,
+    /// first 8 hex — 4.3e9 ids make collisions among a relay's live rooms
+    /// negligible). Deterministic so both sides (and resumes) meet in the
+    /// same room; the memory-hard KDF blocks offline dictionary attacks on
+    /// user-chosen passphrases. See SECURITY.md.
     pub fn room_from_passphrase(passphrase: &str) -> String {
-        use sha2::Digest;
-        let canon = fj_protocol::pake::canonical_passphrase(passphrase);
-        hex::encode(sha2::Sha256::digest(canon.as_bytes()))[..8].to_string()
+        fj_protocol::pake::room_from_passphrase(passphrase)
     }
 
     /// Connect to the relay and join the room derived from the passphrase.
@@ -1565,7 +1616,7 @@ struct Receiver {
     peer: Arc<PeerHandle>,
     sid: String,
     files: HashMap<u16, (PathBuf, Option<std::fs::File>)>,
-    confirmed: bool,
+    preflighted: bool,
     frames: std_mpsc::Receiver<Vec<u8>>,
     /// signaling relay (relay mode); kept alive through the transfer loop —
     /// read only for the p3 blob-4 emission during pairing
@@ -1662,5 +1713,58 @@ mod code_tests {
         // first word segment is not 8 hex -> None (fallback path)
         assert!(parse_pairing_code("word-one-word-two-word-three").is_none());
         assert!(parse_pairing_code("").is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod resolve_tests {
+    use super::Engine;
+    use fj_protocol::ErrorCode;
+    use fj_protocol::manifest::FileEntry;
+
+    fn entry(path: &str, name: &str) -> FileEntry {
+        FileEntry {
+            id: 0,
+            name: name.into(),
+            path: path.into(),
+            size: 1,
+            chunks: 1,
+            chunk_size: 16384,
+            sha256: "a".repeat(64),
+            supersedes: None,
+        }
+    }
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fj-resolve-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tempdir");
+        d
+    }
+
+    #[test]
+    fn resolve_within_rejects_symlink_component() {
+        let dir = unique_dir("sym");
+        std::os::unix::fs::symlink("/tmp", dir.join("destino")).expect("symlink");
+        let e = Engine::resolve_within(&dir, &entry("destino", "x.bin")).unwrap_err();
+        assert_eq!(e, ErrorCode::PathRejected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_within_rejects_symlink_final_component() {
+        let dir = unique_dir("final");
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("x.bin")).expect("symlink");
+        let e = Engine::resolve_within(&dir, &entry("", "x.bin")).unwrap_err();
+        assert_eq!(e, ErrorCode::PathRejected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_within_plain_path_ok() {
+        let dir = unique_dir("plain");
+        let p = Engine::resolve_within(&dir, &entry("sub/dir", "x.bin")).unwrap();
+        assert_eq!(p, dir.join("sub/dir/x.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

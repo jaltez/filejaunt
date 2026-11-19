@@ -23,9 +23,19 @@ hex = "0.4"
 # NOTE (dep note, allowed by plan): unicode-normalization is required to implement the
 # NFKD passphrase canonicalization mandated by the protocol spec (P1.4). Pure, no_std-capable.
 unicode-normalization = "0.1"
+# F6: memory-hard KDF for relay room derivation (blocks offline dictionaries)
+argon2 = "0.5"
+
+[features]
+# F8: test-only helpers (key-material introspection) are compiled out of
+# production and third-party builds entirely.
+test-util = []
 
 [dev-dependencies]
 proptest = "1"
+# Self dev-dependency: enables `test-util` for this crate's own integration
+# tests (tests/*) without leaking the feature into dependents.
+fj-protocol = { path = ".", features = ["test-util"] }
 
 # WASM-only: SystemTime is unavailable on wasm32-unknown-unknown; receipts
 # use js_sys::Date for timestamps in the browser.

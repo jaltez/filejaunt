@@ -7,7 +7,8 @@
 //!
 //! Exported receipt JSON (what `filejaunt verify` consumes):
 //! `{"v":1,"sid":hex32,"pake1":b64,"pake2":b64,"file":...,"sha256":...,
-//!   "bytes":...,"ts":...,"mac":b64,"macpf":b64}`
+//!   "bytes":...,"ts":...,"macpf":b64}` — F14: the session-live `mac` no
+//! longer travels in exports (old receipts carrying it still parse).
 //!
 //! DEVIATION D2 (documented): K_root cannot be re-derived offline from the
 //! public PAKE messages (computational Diffie-Hellman), so the exported
@@ -37,6 +38,10 @@ pub struct ReceiptMsg {
 }
 
 /// Exported receipt file.
+///
+/// F14: the session-live `mac` (K_receipt) is NOT exported — only holders
+/// of the passphrase can verify anything via `macpf`, and old receipts that
+/// carry a stray `mac` still deserialize (serde ignores unknown fields).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Receipt {
     pub v: u8,
@@ -49,7 +54,6 @@ pub struct Receipt {
     pub sha256: String,
     pub bytes: u64,
     pub ts: i64,
-    pub mac: String,
     #[serde(default)]
     pub macpf: String,
 }
@@ -111,14 +115,14 @@ impl Receipt {
             sha256: msg.sha256.clone(),
             bytes: msg.bytes,
             ts: msg.ts,
-            mac: msg.mac.clone(),
             macpf: mac_pf.to_string(),
         }
     }
 
     /// Verify this receipt against a passphrase (any separator casing/form;
     /// canonicalized internally). Checks the passphrase-bound `macpf`.
-    /// Structural validity (hex64, base64) is verified first.
+    /// Structural validity (hex64, base64, PAKE transcript lengths) is
+    /// verified first.
     pub fn verify(&self, passphrase: &str) -> bool {
         if self.v != PROTOCOL_VERSION {
             return false;
@@ -129,6 +133,17 @@ impl Receipt {
         let Ok(sid) = crate::envelope::parse_sid(&self.sid) else {
             return false;
         };
+        // F14: the PAKE transcript fields must be structurally valid before
+        // any MAC work — arbitrary junk must not reach verification.
+        let Ok(p1) = crate::envelope::b64_decode(&self.pake1) else {
+            return false;
+        };
+        let Ok(p2) = crate::envelope::b64_decode(&self.pake2) else {
+            return false;
+        };
+        if p1.len() != crate::pake::PAKE_MSG_LEN || p2.len() != crate::pake::PAKE_MSG_LEN {
+            return false;
+        }
         let canon = crate::pake::canonical_passphrase(passphrase);
         let k_pf = crypto::derive_receipt_pf(canon.as_bytes(), &sid);
         let expect = receipt_mac_pf(

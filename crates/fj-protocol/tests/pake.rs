@@ -106,7 +106,10 @@ fn receipt_mac_pf_verify() {
         mac: "session-mac".into(),
     };
     let macpf = receipt_mac_pf(&k, msg.file, &msg.sha256, msg.bytes, msg.ts);
-    let r = Receipt::from_msg(&msg, &hex::encode(sid), "cGFrZTE=", "cGFrZTI=", &macpf);
+    // verify() now requires structurally valid PAKE transcripts (33 bytes)
+    let pake1 = fj_protocol::envelope::b64(&[7u8; fj_protocol::pake::PAKE_MSG_LEN]);
+    let pake2 = fj_protocol::envelope::b64(&[9u8; fj_protocol::pake::PAKE_MSG_LEN]);
+    let r = Receipt::from_msg(&msg, &hex::encode(sid), &pake1, &pake2, &macpf);
     assert!(r.verify(&pass), "correct passphrase verifies");
     assert!(!r.verify("wrong passphrase"), "wrong passphrase rejected");
     // structural tamper: change bytes

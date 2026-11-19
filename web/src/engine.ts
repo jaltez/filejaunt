@@ -235,6 +235,9 @@ interface Envelope1 {
 
 async function inflateBlob1(raw: string): Promise<Envelope1> {
   const text = raw.trim();
+  // F12: mirror of MAX_BLOB_INPUT in fj-protocol — reject before any
+  // base64/gzip work (memory-exhaustion guard)
+  if (text.length > 512 * 1024) throw new Error('PROTO_MALFORMED: blob input too large');
   if (!text.startsWith('FJ1.')) throw new Error('PROTO_MALFORMED: not a filejaunt blob (missing FJ1. prefix)');
   let b64 = text.slice(4).replace(/-/g, '+').replace(/_/g, '/');
   while (b64.length % 4) b64 += '=';
@@ -1527,6 +1530,12 @@ export class Jaunt {
       this.fail(String(e));
       return null;
     }
+    // F13: validate the sid BEFORE it keys any OPFS/IDB storage — a hostile
+    // blob must not litter arbitrary names into the origin's storage
+    if (!/^[0-9a-f]{32}$/.test(env.sid)) {
+      this.fail('PROTO_MALFORMED: bad sid');
+      return null;
+    }
     const snapshot = await idbGet(env.sid);
     if (!this.core) this.core = await newFjCore();
     const resuming = snapshot !== undefined;
@@ -1552,7 +1561,7 @@ export class Jaunt {
         return null;
       }
       this.hook.sid = env.sid;
-      this.hook.passphrase = pass;
+      if (E2E) this.hook.passphrase = pass;
       this.events.blobOut(blob2);
       this.events.step(
         this.relayMode ? 'private pairing: exchanging blobs via the relay…' : 'paste blob-2 into the sender, then paste its blob-3 here',
@@ -1575,7 +1584,7 @@ export class Jaunt {
     this.transport = t;
     this.wireTransport(t);
     this.hook.sid = env.sid;
-    this.hook.passphrase = pass;
+    if (E2E) this.hook.passphrase = pass;
     this.events.blobOut(blob2);
     this.events.step(
       this.relayMode ? 'pairing complete; connecting' : 'paste blob-2 into the sender; transfer starts when it connects',

@@ -17,6 +17,10 @@ use crate::{ENVELOPE_MAX_JSON, PROTOCOL_VERSION};
 
 pub const ENVELOPE_PREFIX: &str = "FJ1.";
 
+/// F12: hard cap on the raw (still-encoded) blob a peer may hand us before
+/// any base64/gzip work happens. 512 KiB is far above any real envelope.
+pub const MAX_BLOB_INPUT: usize = 512 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingMode {
     /// 2-step: offer SDP in clear inside blob-1.
@@ -180,6 +184,9 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<String> {
 /// Strip prefix, strict b64url decode, gunzip (<= 64 KiB), return JSON string.
 pub fn inflate(raw: &str) -> Result<String> {
     let raw = raw.trim();
+    if raw.len() > MAX_BLOB_INPUT {
+        return err(ErrorCode::ProtoMalformed, "blob input too large");
+    }
     let body = raw.strip_prefix(ENVELOPE_PREFIX).ok_or_else(|| {
         crate::error::Error::new(ErrorCode::ProtoMalformed, "missing FJ1. prefix")
     })?;

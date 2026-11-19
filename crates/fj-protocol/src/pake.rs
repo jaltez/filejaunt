@@ -30,11 +30,13 @@ pub fn canonical_passphrase(input: &str) -> String {
         .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
         .flat_map(|c| c.to_lowercase())
         .collect();
-    s = s.trim().to_string();
+    // F14: read the trimmed form directly (no trimmed copy) and zeroize the
+    // lowercased intermediate before returning.
+    let trimmed = s.trim();
     // collapse [\s-]+ -> '-'
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(trimmed.len());
     let mut in_sep = false;
-    for c in s.chars() {
+    for c in trimmed.chars() {
         if c.is_whitespace() || c == '-' {
             in_sep = true;
         } else {
@@ -45,12 +47,28 @@ pub fn canonical_passphrase(input: &str) -> String {
             out.push(c);
         }
     }
+    s.zeroize();
     out
 }
 
 /// Fresh 16-byte session id from OsRng.
 pub fn new_sid() -> [u8; 16] {
     rand::random()
+}
+
+/// Relay room id: first 8 hex of SHA-256(Argon2id(canonical passphrase)).
+/// Deterministic (fixed salt — both peers must derive it pre-pairing);
+/// the KDF cost is what blocks offline dictionaries.
+pub fn room_from_passphrase(passphrase: &str) -> String {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use sha2::Digest;
+    let canon = canonical_passphrase(passphrase);
+    let params = Params::new(19456, 2, 1, None).expect("valid argon2 params");
+    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    a2.hash_password_into(canon.as_bytes(), b"filejaunt/v1/room", &mut out)
+        .expect("argon2 with valid params and 32-byte out cannot fail");
+    hex::encode(sha2::Sha256::digest(out))[..8].to_string()
 }
 
 /// A started SPAKE2 exchange. `message()` is the public PAKE message for the
@@ -139,5 +157,34 @@ impl AttemptLimiter {
 
     pub fn clear(&mut self, sid: &[u8; 16]) {
         self.failures.remove(sid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::room_from_passphrase;
+
+    #[test]
+    fn room_is_deterministic() {
+        assert_eq!(
+            room_from_passphrase("word-one-word-two"),
+            room_from_passphrase("word-one-word-two")
+        );
+    }
+
+    #[test]
+    fn room_is_form_invariant() {
+        // canonical form: separators, case, and edges collapse identically
+        assert_eq!(
+            room_from_passphrase("word-one-word-two"),
+            room_from_passphrase("  Word One  word-TWO  ")
+        );
+    }
+
+    #[test]
+    fn room_is_eight_lowercase_hex() {
+        let r = room_from_passphrase("some passphrase");
+        assert!(r.len() == 8 && r.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(r, r.to_lowercase(), "lowercase hex");
     }
 }

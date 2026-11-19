@@ -14,8 +14,14 @@ Based on §4 of `SEED.md`. Guarantees and non-guarantees, no marketing.
 | The other endpoint | Per-file receipt: SHA-256 + HMAC (K_receipt live, K_pf offline) verifiable with the passphrase |
 
 Crypto in use (nothing home-made): SPAKE2 (Ed25519 group, `spake2` crate),
-HKDF-SHA256, HMAC-SHA256, AES-256-GCM, constant-time comparisons
-(`subtle`), zeroization of keys/passphrases.
+HKDF-SHA256, HMAC-SHA256, AES-256-GCM, Argon2id (relay room derivation —
+memory-hard KDF so a leaked room id cannot be brute-forced offline),
+constant-time comparisons (`subtle`), zeroization of keys/passphrases.
+
+Version skew: relay pairing requires both parties on the same major version
+(room derivation changed from SHA-256 to Argon2id in 2026-11; mixed-version
+peers derive different rooms and simply never meet — no cross-version
+pairing happens).
 
 ## Not guaranteed
 
@@ -28,6 +34,14 @@ HKDF-SHA256, HMAC-SHA256, AES-256-GCM, constant-time comparisons
   generated/verified by live participants.
 - **Passive tunnelling attacker**: whoever retransmits both blobs verbatim
   can act as a blind tunnel (sees ciphertext only); accepted and documented.
+- **Frame replay by the authenticated peer** (D4): the per-frame counter
+  rides in the header `seq`, so a re-delivered frame decrypts fine; chunk
+  replays are deduplicated by bitmap and APPEND replays are idempotent, but
+  the protocol does not reject replayed frames from a peer that already
+  paired.
+- **Exported receipts**: `mac` (K_receipt) no longer travels in exported
+  receipt files — only the passphrase-bound `macpf` (see D2). Old receipts
+  carrying a stray `mac` still verify.
 
 ## Operational limits
 
@@ -40,6 +54,19 @@ HKDF-SHA256, HMAC-SHA256, AES-256-GCM, constant-time comparisons
 - Session snapshots contain NO key material; keys are re-derived from the
   passphrase on every reconnect (epoch+1 ⇒ fresh nonces).
 - Restrictive CSP in the web app; zero fetch/XHR; hashed single file.
+
+- Relay `FJ_TRUSTED_PROXIES` (default `1`): how many reverse-proxy hops in
+  front of the relay are trusted to append honest `X-Forwarded-For`
+  entries. Set `0` for direct exposure (the header is then ignored); set it
+  to the hop count behind more proxy layers.
+- Input blob cap 512 KiB (`MAX_BLOB_INPUT`): larger pasted blobs are
+  rejected before any base64/gzip work (core, CLI, and web alike).
+- Relay per-peer outbound queue bounded at 32 messages / 256 KiB — a slow
+  peer is dropped, never buffered; join timeout 30 s; max 20 joins/min/IP;
+  WebSocket message and frame caps (256 KiB + 1 KiB) enforced at upgrade.
+- File names: unconditional Windows-hostile rules on every platform — no
+  `:` (NTFS ADS), no trailing `.`/space, no DOS reserved stems (`CON`,
+  `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
 
 ## Reporting policy
 
